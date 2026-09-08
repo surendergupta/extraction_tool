@@ -1,0 +1,24 @@
+__pycache__/
+*.pyc
+.venv/
+.env
+.env.local
+storage_data/
+*.egg-info/
+.pytest_cache/
+dist/
+build/
+
+# Claude Code's own session-internal state - not project content.
+.claude/
+
+# --- ocr_service_eval: real hospital sample data must NEVER be committed ---
+# Defense-in-depth only - the actual policy is that samples live outside this
+# repo entirely (see ocr_service_eval/README.md). Do not rely on this rule
+# alone: gitignore doesn't protect anything already committed, or anything
+# force-added with `git add -f`.
+ocr_service_eval/reports/
+ocr_service_eval/samples/
+ocr_service_eval/.venv/
+**/sense_tool_eval_samples/
+**/*_eval_samples/

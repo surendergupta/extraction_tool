@@ -1,0 +1,7 @@
+httpx==0.28.1
+pytesseract==0.3.13
+pillow==11.0.0
+pdf2image==1.17.0
+opencv-python-headless==4.10.0.84
+numpy==1.26.4
+pdfplumber==0.11.4
