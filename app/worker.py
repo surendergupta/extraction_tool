@@ -52,6 +52,34 @@ async def _fail(session: AsyncSession, document: Document, message: str) -> None
     logger.error("document %s failed: %s", document.id, message)
 
 
+def _persist_image_regions(storage, document_id, images: list) -> list[dict] | None:
+    """Save each crop's bytes under `{document_id}/images/{n}.{ext}` and
+    return a JSON-serialisable metadata list for `Document.image_regions`.
+    Returns None when there are no images so the column stays NULL."""
+    if not images:
+        return None
+    meta: list[dict] = []
+    for n, img in enumerate(images):
+        ext = (img.image_format or "png").lstrip(".")
+        key = f"{document_id}/images/{n}.{ext}"
+        storage.save(key, img.data)
+        meta.append(
+            {
+                "storage_key": key,
+                "bbox": img.bbox,
+                "bbox_space": img.bbox_space,
+                "page": img.page,
+                "source": img.source,
+                "region_type_guess": img.region_type_guess,
+                "width": img.width,
+                "height": img.height,
+                "format": ext,
+            }
+        )
+    logger.info("document %s: stored %d extracted image region(s)", document_id, len(meta))
+    return meta
+
+
 async def run_ocr_extraction(ctx: dict, document_id: str) -> None:
     sessionmaker = ctx["sessionmaker"]
     async with sessionmaker() as session:
@@ -70,6 +98,17 @@ async def run_ocr_extraction(ctx: dict, document_id: str) -> None:
             result = await ocr.extract_text(filename, data)
 
             document.extracted_text = result.text
+            # WP-B: persist extracted image/photo/chart regions. Crop bytes
+            # go to the storage backend next to the raw file; only metadata
+            # (incl. the storage key) lands in the DB. Best-effort - a
+            # failure here must not fail the OCR step, since text is the
+            # primary product and images are additive.
+            try:
+                document.image_regions = _persist_image_regions(
+                    storage, document.id, result.images
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("document %s: storing image regions failed: %s", document.id, exc)
             await session.commit()
         except httpx.TimeoutException:
             timeout_seconds = settings.ocr_read_timeout_seconds
@@ -80,15 +119,30 @@ async def run_ocr_extraction(ctx: dict, document_id: str) -> None:
             return
 
     redis = ctx["redis"]
-    # native_tables (pdfplumber's extract_tables() output, from the
-    # native-PDF-text path only - empty otherwise) rides along to the next
-    # job rather than a DB column, since it's only needed transiently
-    # between these two chained steps.
-    await redis.enqueue_job("run_structure_parsing", str(document_id), result.tables)
+    # These ride along to the next job rather than a DB column - only needed
+    # transiently between these two chained steps:
+    #  - native_tables: pdfplumber extract_tables() grids (native-PDF path only)
+    #  - ruled_line_regions: WP-D ruled-line table regions (OCR path only)
+    #  - text_source: "native_pdf" | "ocr" - picks which of the above applies
+    #    and whether the legacy space-heuristic may run on the text.
+    await redis.enqueue_job(
+        "run_structure_parsing",
+        str(document_id),
+        result.tables,
+        [
+            {"bbox": tr.bbox, "region_text": tr.region_text, "page": tr.page}
+            for tr in result.table_regions
+        ],
+        result.text_source,
+    )
 
 
 async def run_structure_parsing(
-    ctx: dict, document_id: str, native_tables: list | None = None
+    ctx: dict,
+    document_id: str,
+    native_tables: list | None = None,
+    ruled_line_regions: list | None = None,
+    text_source: str | None = None,
 ) -> None:
     sessionmaker = ctx["sessionmaker"]
     async with sessionmaker() as session:
@@ -99,7 +153,13 @@ async def run_structure_parsing(
 
         try:
             structured_data = structure.parse_structure(
-                document.extracted_text, native_tables=native_tables
+                document.extracted_text,
+                native_tables=native_tables,
+                ruled_line_regions=ruled_line_regions,
+                # The legacy space-heuristic table detector is pure garbage
+                # on OCR text (WP-C/WP-D) - only let it run for native-PDF
+                # text, where its module docstring notes it "never fires".
+                space_heuristic_tables=(text_source != "ocr"),
             )
             document.structured_data = structured_data
             document.status = DocumentStatus.DONE

@@ -1,25 +1,36 @@
 """Heuristic structure extraction: split OCR'd text into sections and tables.
 
-v1 is intentionally simple:
-  - a short line that is ALL CAPS or ends with ':' starts a new section -
-    unless it (or the line right before it) contains a digit, since that's
-    real lab-report evidence of a data row or a method-name annotation
-    glued to one, not a heading (see _is_header_line)
-  - consecutive lines that look column-aligned (pipe, tab, or 2+ runs of
-    2+ spaces) are grouped into a table block
+Sections (all paths): a short line that is ALL CAPS or ends with ':' starts
+a new section - unless it (or the line right before it) contains a digit,
+since that's real lab-report evidence of a data row or a method-name
+annotation glued to one, not a heading (see _is_header_line).
 
-This is not meant to be a robust table/layout parser - just enough
-structure to make exports useful.
+Tables come from one of three sources, and `structured_data["tables"]`
+entries therefore have MORE THAN ONE SHAPE - a consumer (e.g. docx export)
+MUST branch on each entry's `source` and cannot assume uniformity:
 
-Exception: for the native-PDF-text path, pdfplumber's own extract_tables()
-runs on the real page objects in ocr_service (see
-ocr_service/app/ocr.py::_try_native_pdf_text) and is passed in here as
-`native_tables`. Native PDF text extraction collapses a table's visual
-column spacing into single spaces, so the space-heuristic detector below
-never fires on those rows - real, structured table data from pdfplumber is
-used instead of the heuristic whenever it's available, since it's strictly
-more reliable for that path. The OCR/rasterized path has no page object to
-extract_tables() from and always falls back to the heuristic, unchanged.
+  - source="native_pdf"        {raw_lines, rows: list[list[str]], source}
+      A real grid from pdfplumber's extract_tables() on the native-PDF
+      page objects (see ocr_service/app/ocr.py::_try_native_pdf_text),
+      passed in as `native_tables`.
+  - source="ruled_line_region" {bbox, region_text: str, source}
+      WP-D: the rasterize+OCR path's ruled-line table detector
+      (ocr_service/app/tables.py) found a ruled table's bounding box and
+      OCR'd it as one block. NO grid - `region_text` is a text blob.
+      Passed in as `ruled_line_regions`.
+  - source="heuristic"         {raw_lines, rows: list[list[str]], source}
+      The old space-alignment guesser (pipe / tab / 2+ space-runs). WP-C
+      and WP-D measured this as pure garbage on scanned/photo OCR text
+      (1-12 bogus tables per page), so it is DISABLED for that path
+      (`space_heuristic_tables=False`, set by the worker when
+      `text_source == "ocr"`). It still runs for native-PDF text, where
+      its own history shows it "never fires" (native extraction collapses
+      column spacing to single spaces) - kept only as a harmless no-op
+      safety net there, not removed wholesale.
+
+Native `tables` and `ruled_line_regions` are mutually exclusive in
+practice (a document takes one path or the other); if both were somehow
+supplied, `native_tables` wins.
 """
 
 import logging
@@ -151,20 +162,53 @@ def _convert_native_tables(native_tables: list) -> list[dict[str, Any]]:
     return converted
 
 
-def parse_structure(text: str | None, native_tables: list | None = None) -> dict[str, Any]:
+def _convert_ruled_regions(regions: list) -> list[dict[str, Any]]:
+    """WP-D ruled-line table regions -> `structured_data["tables"]` entries.
+    Deliberately NOT a grid: each entry is `{bbox, region_text, source}`
+    (see module docstring). Skips empty / malformed entries defensively."""
+    converted: list[dict[str, Any]] = []
+    for r in regions or []:
+        if not isinstance(r, dict):
+            continue
+        text = r.get("region_text")
+        if not isinstance(text, str) or not text.strip():
+            continue
+        converted.append(
+            {
+                "bbox": r.get("bbox"),
+                "region_text": text,
+                "source": "ruled_line_region",
+            }
+        )
+    return converted
+
+
+def parse_structure(
+    text: str | None,
+    native_tables: list | None = None,
+    ruled_line_regions: list | None = None,
+    space_heuristic_tables: bool = True,
+) -> dict[str, Any]:
     """Return `{"sections": [...], "tables": [...]}` parsed from `text`.
 
-    `native_tables` (optional): pdfplumber's raw extract_tables() output for
-    a native-PDF-text document, one entry per table across all pages. When
-    non-empty, these populate the returned `tables` directly instead of the
-    space-heuristic detector (see module docstring). Section detection is
-    unaffected either way - the heuristic never treated these rows as table
-    lines in the first place (that's the bug this exists to work around),
-    so skipping the heuristic's table-detection here doesn't change how
-    section text is grouped.
+    Table source (see module docstring for the differing entry shapes):
+      - `native_tables`         -> source="native_pdf" grid entries
+      - `ruled_line_regions`    -> source="ruled_line_region" text-blob
+                                    entries (used only when native_tables
+                                    is empty)
+      - the space-alignment heuristic -> source="heuristic" grid entries,
+        used only when neither of the above applies AND
+        `space_heuristic_tables` is True. The worker sets it False for the
+        rasterize+OCR path (WP-C/WP-D: pure garbage there).
+
+    Section detection is identical in every case.
     """
     lines = text.splitlines() if text else []
     use_native_tables = bool(native_tables)
+    use_ruled_regions = bool(ruled_line_regions) and not use_native_tables
+    run_heuristic_tables = (
+        space_heuristic_tables and not use_native_tables and not use_ruled_regions
+    )
 
     sections: list[dict[str, Any]] = []
     tables: list[dict[str, Any]] = []
@@ -205,7 +249,7 @@ def parse_structure(text: str | None, native_tables: list | None = None) -> dict
         if not stripped:
             previous_line = None
             continue
-        if not use_native_tables and _is_table_line(line):
+        if run_heuristic_tables and _is_table_line(line):
             table_buffer.append(line)
             previous_line = stripped
             continue
@@ -222,5 +266,9 @@ def parse_structure(text: str | None, native_tables: list | None = None) -> dict
 
     if use_native_tables:
         tables = _convert_native_tables(native_tables)
+    elif use_ruled_regions:
+        tables = _convert_ruled_regions(ruled_line_regions)
+    # else: `tables` holds whatever the space-heuristic buffered (empty
+    # unless run_heuristic_tables was True).
 
     return {"sections": sections, "tables": tables}

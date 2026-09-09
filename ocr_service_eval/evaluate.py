@@ -105,9 +105,11 @@ if not REUSING_SERVICE_MODULES:
     # Mirrors ocr_service/app/ocr.py::_NATIVE_TEXT_MIN_CHARS - keep in sync.
     NATIVE_TEXT_MIN_CHARS = 20
 
-    def tesseract_config(psm: int) -> str:
-        # Mirrors ocr_service/app/ocr.py::_tesseract_config.
-        return f"--oem 1 --psm {psm} -l eng"
+    def tesseract_config(psm: int, lang: str = "eng") -> str:
+        # Mirrors ocr_service/app/ocr.py::_tesseract_config. This harness
+        # only ever measures the English default; `lang` mirrors the source
+        # signature so a positional call stays valid either way.
+        return f"--oem 1 --psm {psm} -l {lang}"
 
     def preprocess_image(img_bgr: np.ndarray) -> np.ndarray:
         # Mirrors ocr_service/app/preprocess.py::preprocess_image.
@@ -244,7 +246,12 @@ def evaluate_document(
         )
         elapsed = time.monotonic() - t0
         response.raise_for_status()
-        text = response.json()["text"]
+        _body = response.json()
+        text = _body["text"]
+        # WP-D: the OCR-fallback path returns ruled-line table *regions*
+        # (bbox + region_text, no grid) instead of the old space-heuristic.
+        _ocr_table_regions = _body.get("table_regions", [])
+        _text_source = _body.get("text_source", "ocr")
     except Exception as exc:  # noqa: BLE001 - report as a failed row, keep going
         return DocResult(
             filename=file_path.name,
@@ -264,9 +271,15 @@ def evaluate_document(
 
     # 2. Path taken - inferred (the endpoint doesn't report this): a PDF
     #    took the native-text shortcut iff it has a usable text layer.
+    #    Since WP-B, ocr_service's _try_native_pdf_text takes an
+    #    `extract_images` flag and returns a (text, tables, images) tuple -
+    #    turn image extraction off for this probe and accept either the
+    #    tuple (real module) or a bare str (the local fallback).
     path_taken = "ocr"
     if is_pdf:
-        path_taken = "native" if try_native_pdf_text(data) is not None else "ocr"
+        probe = try_native_pdf_text(data, False) if REUSING_SERVICE_MODULES else try_native_pdf_text(data)
+        native_text = probe[0] if isinstance(probe, tuple) else probe
+        path_taken = "native" if native_text is not None else "ocr"
 
     # 3. Confidence - only meaningful for documents that actually ran OCR.
     avg_confidence = None
@@ -284,7 +297,14 @@ def evaluate_document(
         flags.append("near_empty_output")
 
     # 5. Structure-detection sanity check (Sense_tool's real heuristics).
-    structured = parse_structure(text)
+    #    Mirror what the production pipeline does: on the OCR-fallback path
+    #    the space-heuristic table detector is disabled and the ruled-line
+    #    table regions from the /ocr response are used instead (WP-D).
+    structured = parse_structure(
+        text,
+        ruled_line_regions=_ocr_table_regions or None,
+        space_heuristic_tables=(_text_source != "ocr"),
+    )
     sections_detected = len(structured["sections"])
     tables_detected = len(structured["tables"])
     if sections_detected == 0 and tables_detected == 0:

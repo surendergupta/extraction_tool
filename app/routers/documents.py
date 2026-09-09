@@ -106,8 +106,22 @@ async def export_document(
             detail=f"Document is not ready for export (status={document.status.value})",
         )
 
+    # WP-F: resolve the WP-B extracted-image crop bytes so the docx/xlsx
+    # renderers can embed them. A missing/unreadable crop is skipped, not
+    # fatal - the rest of the export must still succeed.
+    images: list[dict] = []
+    if document.image_regions:
+        storage = get_storage_backend()
+        for meta in document.image_regions:
+            key = meta.get("storage_key")
+            try:
+                data = storage.read(key) if key else None
+            except Exception:  # noqa: BLE001
+                data = None
+            images.append({**meta, "data": data})
+
     try:
-        content = export.render(format, document.source, document.structured_data)
+        content = export.render(format, document.source, document.structured_data, images=images)
     except export.ExportError as exc:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
 

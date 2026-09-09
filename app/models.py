@@ -25,6 +25,13 @@ class Document(Base):
     raw_file_path: Mapped[str] = mapped_column(String(1024), nullable=False)
     extracted_text: Mapped[str | None] = mapped_column(Text, nullable=True)
     structured_data: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
+    # WP-B: metadata for extracted image/photo/chart regions. A JSON array of
+    # {bbox, bbox_space, page, source, region_type_guess, storage_key,
+    # width, height, format}. The crop bytes themselves live in the storage
+    # backend at `storage_key`; only the metadata is in the DB. Populated by
+    # the OCR worker step; NOT consumed by structure parsing or export yet
+    # (that is a later work package).
+    image_regions: Mapped[list | None] = mapped_column(JSONB, nullable=True)
     error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
 
     # Generated/stored column powering full-text search (GIN-indexed in the migration).

@@ -1,10 +1,16 @@
-"""English-only OCR core: native PDF text first, Tesseract (LSTM) otherwise.
+"""OCR core: native PDF text first, Tesseract (LSTM) otherwise.
 
-Deliberately minimal for v1: Tesseract is excellent for clean, printed
-English and is native-CPU/lightweight. Heavier engines (PaddleOCR fallback,
-LayoutParser, Camelot, spaCy post-processing) are NOT included here -
-add them only once real documents prove Tesseract-only accuracy is
-insufficient, not speculatively.
+English-only by default. The Tesseract rasterize+OCR path also accepts a
+combined language string (`eng+guj`, `eng+nep`) for single-pass
+multi-script recognition - opt-in per request via the /ocr `lang` param,
+never the default (see README.md for the measured English-accuracy
+tradeoff). The tessdata for every supported code is baked into the Docker
+image (see ../Dockerfile).
+
+Deliberately minimal for v1: Tesseract is native-CPU/lightweight. Heavier
+engines (PaddleOCR fallback, LayoutParser, Camelot, spaCy post-processing)
+are NOT included here - add them only once real documents prove
+Tesseract-only accuracy is insufficient, not speculatively.
 """
 
 import io
@@ -17,7 +23,9 @@ import numpy as np
 import pytesseract
 from PIL import Image
 
+from app.images import ExtractedImage, extract_native_pdf_images, images_from_page_array
 from app.preprocess import preprocess_image
+from app.tables import RuledTableRegion, detect_ruled_table_regions
 
 logger = logging.getLogger("ocr_service.ocr")
 
@@ -26,7 +34,15 @@ logger = logging.getLogger("ocr_service.ocr")
 _NATIVE_TEXT_MIN_CHARS = 20
 
 _DEFAULT_PSM = 6  # "assume a single uniform block of text"
-_OEM = 1  # LSTM engine only - the fast, English-tuned model in Tesseract 5
+_OEM = 1  # LSTM engine only - the fast neural line-recognizer in Tesseract 5
+
+# Tesseract accepts a single language ("eng") or a "+"-joined combination
+# ("eng+guj") for multi-script recognition in one pass. The default stays
+# English-only so existing callers see byte-for-byte identical behaviour;
+# combined modes are strictly opt-in per request (see README.md for the
+# measured English-accuracy tradeoff that drove that choice). Each code
+# here must have matching tessdata baked into the image (see Dockerfile).
+_DEFAULT_LANG = "eng"
 
 # A pdfplumber table is List[List[Optional[str]]] (rows of cells, cells
 # nullable). NativeTable keeps that raw shape; the caller (Sense_tool's
@@ -37,20 +53,43 @@ NativeTable = list[list[str | None]]
 @dataclass
 class OcrResult:
     text: str
-    # Only ever non-empty for the native-PDF-text path - the OCR/rasterized
-    # path has no pdfplumber page object to call extract_tables() on.
+    # NATIVE-PDF path only: pdfplumber extract_tables() output - a real
+    # grid, list[list[cell]] per table. Always [] on the rasterize+OCR path.
     tables: list[NativeTable] = field(default_factory=list)
+    # RASTERIZE+OCR path only (WP-D): ruled-line table *regions*. Each is a
+    # bbox + a whole-region OCR text blob - NO grid (see app/tables.py).
+    # Always [] on the native-PDF path. `tables` and `table_regions` are
+    # deliberately different shapes; downstream branches on the entry's
+    # `source` ("native_pdf" vs "ruled_line_region") and must not assume a
+    # uniform shape.
+    table_regions: list["RuledTableRegion"] = field(default_factory=list)
+    # Which path produced `text`: "native_pdf" or "ocr". The structure
+    # parser uses this to decide whether the legacy space-heuristic table
+    # detector may run (native only - it is pure garbage on OCR text, per
+    # WP-C/WP-D, and is replaced there by `table_regions`).
+    text_source: str = "ocr"
+    # WP-B: extracted image/photo/chart regions. "embedded" ones come from
+    # pdfplumber's page.images on the native path; "detected" ones come from
+    # the heuristic region detector on the rasterise+OCR path. Purely
+    # additive - text/tables above are unaffected by this. See app/images.py.
+    images: list["ExtractedImage"] = field(default_factory=list)
 
 
 class OCRError(RuntimeError):
     """Raised when text extraction fails."""
 
 
-def _tesseract_config(psm: int) -> str:
-    return f"--oem {_OEM} --psm {psm} -l eng"
+def _tesseract_config(psm: int, lang: str = _DEFAULT_LANG) -> str:
+    return f"--oem {_OEM} --psm {psm} -l {lang}"
 
 
-def extract_text_from_bytes(filename: str, data: bytes, psm: int = _DEFAULT_PSM) -> OcrResult:
+def extract_text_from_bytes(
+    filename: str,
+    data: bytes,
+    psm: int = _DEFAULT_PSM,
+    lang: str = _DEFAULT_LANG,
+    extract_images: bool = True,
+) -> OcrResult:
     if not data:
         raise OCRError("Empty file")
 
@@ -59,11 +98,25 @@ def extract_text_from_bytes(filename: str, data: bytes, psm: int = _DEFAULT_PSM)
 
     try:
         if is_pdf:
-            native_text, native_tables = _try_native_pdf_text(data)
+            native_text, native_tables, native_images = _try_native_pdf_text(data, extract_images)
             if native_text is not None:
-                return OcrResult(text=native_text, tables=native_tables)
-            return OcrResult(text=_extract_pdf_via_ocr(data, psm))
-        return OcrResult(text=_extract_image(data, psm))
+                # Native PDF text is the PDF's own Unicode text layer - it is
+                # already script-correct regardless of `lang`, which only
+                # affects the Tesseract rasterize+OCR path below.
+                return OcrResult(
+                    text=native_text,
+                    tables=native_tables,
+                    images=native_images,
+                    text_source="native_pdf",
+                )
+            text, images, table_regions = _extract_pdf_via_ocr(data, psm, lang, extract_images)
+            return OcrResult(
+                text=text, images=images, table_regions=table_regions, text_source="ocr"
+            )
+        text, images, table_regions = _extract_image(data, psm, lang, extract_images)
+        return OcrResult(
+            text=text, images=images, table_regions=table_regions, text_source="ocr"
+        )
     except OCRError:
         raise
     except Exception as exc:  # noqa: BLE001 - normalize to a domain error
@@ -174,11 +227,14 @@ def _drop_spurious_rows(table: NativeTable) -> NativeTable:
     return [row for row in table if not _is_spurious_row(row)]
 
 
-def _try_native_pdf_text(data: bytes) -> tuple[str | None, list[NativeTable]]:
-    """Return (embedded PDF text, tables) directly, skipping OCR entirely,
-    when the PDF has a real text layer (i.e. it isn't just a scanned
-    image). Tables come from the same pdfplumber page objects used for
-    text - the page isn't discarded once text is pulled off it.
+def _try_native_pdf_text(
+    data: bytes, extract_images: bool = True
+) -> tuple[str | None, list[NativeTable], list[ExtractedImage]]:
+    """Return (embedded PDF text, tables, embedded images) directly, skipping
+    OCR entirely, when the PDF has a real text layer (i.e. it isn't just a
+    scanned image). Tables and images come from the same pdfplumber page
+    objects used for text - the page isn't discarded once text is pulled
+    off it.
 
     Uses pdfplumber (MIT-licensed) rather than PyMuPDF (AGPLv3) - Sense_tool
     has no legal review clearing AGPLv3 for production/commercial use.
@@ -189,6 +245,12 @@ def _try_native_pdf_text(data: bytes) -> tuple[str | None, list[NativeTable]]:
         with pdfplumber.open(io.BytesIO(data)) as pdf:
             page_texts: list[str] = []
             tables: list[NativeTable] = []
+            images: list[ExtractedImage] = []
+            if extract_images:
+                try:
+                    images = extract_native_pdf_images(pdf)
+                except Exception as exc:  # noqa: BLE001 - never let image extraction break text
+                    logger.warning("native embedded-image extraction failed: %s", exc)
             for page in pdf.pages:
                 page_texts.append((page.extract_text() or "").strip())
 
@@ -232,28 +294,51 @@ def _try_native_pdf_text(data: bytes) -> tuple[str | None, list[NativeTable]]:
 
                     tables.append(cleaned)
     except Exception:
-        return None, []
+        return None, [], []
 
     combined = "\n\n".join(t for t in page_texts if t)
     if len(combined) >= _NATIVE_TEXT_MIN_CHARS:
-        return combined, tables
-    return None, []
+        return combined, tables, images
+    return None, [], []
 
 
-def _extract_image(data: bytes, psm: int) -> str:
+def _detect_images_safe(cv_img: np.ndarray, page: int) -> list[ExtractedImage]:
+    """Region detection must never break text extraction - swallow anything."""
+    try:
+        return images_from_page_array(cv_img, page=page)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("image region detection failed on page %d: %s", page, exc)
+        return []
+
+
+def _extract_image(
+    data: bytes, psm: int, lang: str = _DEFAULT_LANG, extract_images: bool = True
+) -> tuple[str, list[ExtractedImage], list[RuledTableRegion]]:
     pil_img = Image.open(io.BytesIO(data)).convert("RGB")
     cv_img = cv2.cvtColor(np.array(pil_img), cv2.COLOR_RGB2BGR)
+    images = _detect_images_safe(cv_img, 0) if extract_images else []
+    # WP-D: ruled-line table regions - OCR-fallback path only. Safe by
+    # contract (returns [] on any failure); never blocks text extraction.
+    table_regions = detect_ruled_table_regions(cv_img, page=0)
     processed = preprocess_image(cv_img)
-    return pytesseract.image_to_string(processed, config=_tesseract_config(psm))
+    text = pytesseract.image_to_string(processed, config=_tesseract_config(psm, lang))
+    return text, images, table_regions
 
 
-def _extract_pdf_via_ocr(data: bytes, psm: int) -> str:
+def _extract_pdf_via_ocr(
+    data: bytes, psm: int, lang: str = _DEFAULT_LANG, extract_images: bool = True
+) -> tuple[str, list[ExtractedImage], list[RuledTableRegion]]:
     from pdf2image import convert_from_bytes
 
     pages = convert_from_bytes(data)
     texts = []
-    for page in pages:
+    images: list[ExtractedImage] = []
+    table_regions: list[RuledTableRegion] = []
+    for i, page in enumerate(pages):
         cv_img = cv2.cvtColor(np.array(page.convert("RGB")), cv2.COLOR_RGB2BGR)
+        if extract_images:
+            images.extend(_detect_images_safe(cv_img, i))
+        table_regions.extend(detect_ruled_table_regions(cv_img, page=i))
         processed = preprocess_image(cv_img)
-        texts.append(pytesseract.image_to_string(processed, config=_tesseract_config(psm)))
-    return "\n\n".join(texts)
+        texts.append(pytesseract.image_to_string(processed, config=_tesseract_config(psm, lang)))
+    return "\n\n".join(texts), images, table_regions

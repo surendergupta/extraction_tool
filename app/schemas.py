@@ -26,6 +26,10 @@ class DocumentOut(BaseModel):
     raw_file_path: str
     extracted_text: str | None = None
     structured_data: dict[str, Any] | None = None
+    # WP-B: metadata for extracted image/photo/chart regions (bbox, page,
+    # best-effort type guess, and the storage key of the crop). Detection +
+    # extraction only - not consumed by structure parsing or export yet.
+    image_regions: list[dict[str, Any]] | None = None
     error_message: str | None = None
     created_at: datetime
     updated_at: datetime
