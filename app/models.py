@@ -32,6 +32,24 @@ class Document(Base):
     # the OCR worker step; NOT consumed by structure parsing or export yet
     # (that is a later work package).
     image_regions: Mapped[list | None] = mapped_column(JSONB, nullable=True)
+
+    # WP-G: how `extracted_text` was produced and how the document exports as
+    # a pixel-perfect PDF.
+    #   text_source        "native_pdf" -> export streams the stored original
+    #                      file verbatim; "ocr" -> export streams the
+    #                      searchable PDF at `searchable_pdf_key`. NULL for
+    #                      documents processed before WP-G (export falls back
+    #                      to the legacy structured-text PDF).
+    #   ocr_lang           Tesseract language string used for the OCR run
+    #                      ("eng", "eng+guj", ...). Kept so the searchable
+    #                      PDF's invisible text layer matches the OCR run.
+    #   searchable_pdf_key storage key of the pre-generated searchable PDF
+    #                      (built in the OCR worker step). NULL on the
+    #                      native-PDF path and for pre-WP-G documents.
+    text_source: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    ocr_lang: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    searchable_pdf_key: Mapped[str | None] = mapped_column(String(1024), nullable=True)
+
     error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
 
     # Generated/stored column powering full-text search (GIN-indexed in the migration).

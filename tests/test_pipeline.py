@@ -7,7 +7,11 @@ from app.config import get_settings
 from app.enums import DocumentStatus
 from app.services.ocr import OcrImage, OCRError, OcrResult, RuledTableRegion
 from app.storage import get_storage_backend
-from app.worker import run_ocr_extraction, run_structure_parsing
+from app.worker import (
+    run_ocr_extraction,
+    run_searchable_pdf_generation,
+    run_structure_parsing,
+)
 
 pytestmark = pytest.mark.asyncio(loop_scope="session")
 
@@ -17,7 +21,7 @@ async def test_ocr_step_moves_queued_to_processing_and_extracts_text(
 ):
     document = await make_document(status=DocumentStatus.QUEUED)
 
-    async def fake_extract_text(filename: str, data: bytes) -> OcrResult:
+    async def fake_extract_text(filename: str, data: bytes, **kwargs) -> OcrResult:
         return OcrResult(text="PATIENT HISTORY:\nNo prior admissions.")
 
     monkeypatch.setattr("app.worker.ocr.extract_text", fake_extract_text)
@@ -55,7 +59,7 @@ async def test_structure_step_populates_structured_data_and_marks_done(make_docu
 async def test_full_pipeline_queued_to_done(make_document, worker_ctx, monkeypatch):
     document = await make_document(status=DocumentStatus.QUEUED)
 
-    async def fake_extract_text(filename: str, data: bytes) -> OcrResult:
+    async def fake_extract_text(filename: str, data: bytes, **kwargs) -> OcrResult:
         return OcrResult(text="NOTES:\nEverything looks normal.")
 
     monkeypatch.setattr("app.worker.ocr.extract_text", fake_extract_text)
@@ -78,7 +82,7 @@ async def test_ocr_step_persists_image_regions_and_crop_bytes(
     and this must not disturb text extraction or the job chain."""
     document = await make_document(status=DocumentStatus.QUEUED)
 
-    async def fake_extract_text(filename: str, data: bytes) -> OcrResult:
+    async def fake_extract_text(filename: str, data: bytes, **kwargs) -> OcrResult:
         return OcrResult(
             text="REPORT:\nfindings here.",
             images=[
@@ -139,7 +143,7 @@ async def test_ocr_step_leaves_image_regions_null_when_none_returned(
 ):
     document = await make_document(status=DocumentStatus.QUEUED)
 
-    async def fake_extract_text(filename: str, data: bytes) -> OcrResult:
+    async def fake_extract_text(filename: str, data: bytes, **kwargs) -> OcrResult:
         return OcrResult(text="PLAIN:\njust text.")
 
     monkeypatch.setattr("app.worker.ocr.extract_text", fake_extract_text)
@@ -148,6 +152,155 @@ async def test_ocr_step_leaves_image_regions_null_when_none_returned(
     async with worker_ctx["sessionmaker"]() as session:
         refreshed = await session.get(type(document), document.id)
         assert refreshed.image_regions is None
+
+
+# --- WP-G: two-pass architecture --------------------------------------------
+# The primary OCR step NO LONGER touches the searchable PDF. It records
+# text_source / ocr_lang and, for the OCR path only, enqueues a separate
+# `run_searchable_pdf_generation` follow-up job. That job is fully isolated:
+# any failure leaves searchable_pdf_key NULL and never affects the document.
+
+
+async def test_ocr_step_records_source_and_enqueues_searchable_pdf_job(
+    make_document, worker_ctx, monkeypatch
+):
+    """rasterize+OCR path: extract_text is called WITHOUT any searchable_pdf
+    coupling; text_source / ocr_lang are persisted; searchable_pdf_key stays
+    NULL here; a follow-up run_searchable_pdf_generation job is enqueued."""
+    document = await make_document(status=DocumentStatus.QUEUED)
+    seen_kwargs = {}
+
+    async def fake_extract_text(filename: str, data: bytes, **kwargs) -> OcrResult:
+        seen_kwargs.update(kwargs)
+        return OcrResult(text="EXAM REPORT:\nfindings.", text_source="ocr")
+
+    monkeypatch.setattr("app.worker.ocr.extract_text", fake_extract_text)
+
+    await run_ocr_extraction(worker_ctx, str(document.id))
+
+    assert "searchable_pdf" not in seen_kwargs           # no inline coupling
+    assert seen_kwargs.get("lang") == "eng"
+
+    async with worker_ctx["sessionmaker"]() as session:
+        refreshed = await session.get(type(document), document.id)
+        assert refreshed.text_source == "ocr"
+        assert refreshed.ocr_lang == "eng"
+        assert refreshed.searchable_pdf_key is None       # not built by this step
+
+    queued = await worker_ctx["redis"].queued_jobs()
+    funcs = [j.function for j in queued]
+    assert "run_structure_parsing" in funcs
+    sp_job = next(j for j in queued if j.function == "run_searchable_pdf_generation")
+    assert sp_job.args == (str(document.id), "eng")
+
+
+async def test_ocr_step_native_pdf_records_source_and_enqueues_no_pdf_job(
+    make_document, worker_ctx, monkeypatch
+):
+    """native-PDF path: text_source='native_pdf', and NO searchable-PDF job
+    is enqueued (export streams the original file)."""
+    document = await make_document(status=DocumentStatus.QUEUED)
+
+    async def fake_extract_text(filename: str, data: bytes, **kwargs) -> OcrResult:
+        return OcrResult(text="NATIVE TEXT LAYER", text_source="native_pdf")
+
+    monkeypatch.setattr("app.worker.ocr.extract_text", fake_extract_text)
+
+    await run_ocr_extraction(worker_ctx, str(document.id))
+
+    async with worker_ctx["sessionmaker"]() as session:
+        refreshed = await session.get(type(document), document.id)
+        assert refreshed.text_source == "native_pdf"
+        assert refreshed.searchable_pdf_key is None
+
+    queued = await worker_ctx["redis"].queued_jobs()
+    assert "run_searchable_pdf_generation" not in [j.function for j in queued]
+
+
+async def test_ocr_step_threads_non_default_lang_into_pdf_job(
+    make_document, worker_ctx, monkeypatch
+):
+    """WP-A lang threading: a non-default lang reaches the follow-up job."""
+    document = await make_document(status=DocumentStatus.QUEUED)
+
+    async def fake_extract_text(filename: str, data: bytes, **kwargs) -> OcrResult:
+        return OcrResult(text="x", text_source="ocr")
+
+    monkeypatch.setattr("app.worker.ocr.extract_text", fake_extract_text)
+
+    await run_ocr_extraction(worker_ctx, str(document.id), lang="eng+guj")
+
+    async with worker_ctx["sessionmaker"]() as session:
+        refreshed = await session.get(type(document), document.id)
+        assert refreshed.ocr_lang == "eng+guj"
+
+    queued = await worker_ctx["redis"].queued_jobs()
+    sp_job = next(j for j in queued if j.function == "run_searchable_pdf_generation")
+    assert sp_job.args == (str(document.id), "eng+guj")
+
+
+async def test_searchable_pdf_job_generates_and_stores(
+    make_document, worker_ctx, monkeypatch
+):
+    """The follow-up job calls the service, stores the PDF at
+    `{id}/searchable.pdf`, and sets searchable_pdf_key. Fabricated bytes."""
+    document = await make_document(
+        status=DocumentStatus.DONE, extracted_text="unchanged", text_source="ocr",
+    )
+    fake_pdf = b"%PDF-1.5 fabricated searchable pdf for test\n%%EOF"
+    seen = {}
+
+    async def fake_generate(filename: str, data: bytes, lang=None) -> bytes:
+        seen["filename"] = filename
+        seen["lang"] = lang
+        return fake_pdf
+
+    monkeypatch.setattr("app.worker.ocr.generate_searchable_pdf", fake_generate)
+
+    await run_searchable_pdf_generation(worker_ctx, str(document.id), "eng+nep")
+
+    assert seen["lang"] == "eng+nep"
+    storage = get_storage_backend()
+    async with worker_ctx["sessionmaker"]() as session:
+        refreshed = await session.get(type(document), document.id)
+        assert refreshed.searchable_pdf_key == f"{document.id}/searchable.pdf"
+        assert storage.read(refreshed.searchable_pdf_key) == fake_pdf
+        assert refreshed.extracted_text == "unchanged"     # untouched
+        assert refreshed.status == DocumentStatus.DONE      # untouched
+
+
+async def test_searchable_pdf_job_failure_is_fully_isolated(
+    make_document, worker_ctx, monkeypatch
+):
+    """A generation failure must not raise, not change status / extracted_text,
+    and must leave searchable_pdf_key NULL so /export falls back."""
+    document = await make_document(
+        status=DocumentStatus.DONE, extracted_text="primary result stays",
+        structured_data={"sections": [], "tables": []}, text_source="ocr",
+    )
+
+    async def boom(filename: str, data: bytes, lang=None) -> bytes:
+        raise ocr.OCRError("searchable-PDF service exploded")
+
+    monkeypatch.setattr("app.worker.ocr.generate_searchable_pdf", boom)
+
+    # must not raise
+    await run_searchable_pdf_generation(worker_ctx, str(document.id), "eng")
+
+    async with worker_ctx["sessionmaker"]() as session:
+        refreshed = await session.get(type(document), document.id)
+        assert refreshed.status == DocumentStatus.DONE
+        assert refreshed.extracted_text == "primary result stays"
+        assert refreshed.searchable_pdf_key is None
+
+
+async def test_searchable_pdf_job_missing_document_is_noop(worker_ctx, monkeypatch):
+    async def fake_generate(*a, **k):
+        raise AssertionError("should not be called for a missing document")
+
+    monkeypatch.setattr("app.worker.ocr.generate_searchable_pdf", fake_generate)
+    # must not raise
+    await run_searchable_pdf_generation(worker_ctx, str(uuid.uuid4()), "eng")
 
 
 async def test_native_pdf_tables_flow_through_to_structured_data(
@@ -164,7 +317,7 @@ async def test_native_pdf_tables_flow_through_to_structured_data(
         ["WBC", "L", "9.6", "4-10", "10^3/mm3"],
     ]
 
-    async def fake_extract_text(filename: str, data: bytes) -> OcrResult:
+    async def fake_extract_text(filename: str, data: bytes, **kwargs) -> OcrResult:
         return OcrResult(
             text="LAB REPORT:\nSee results below.",
             tables=[native_table],
@@ -210,7 +363,7 @@ async def test_ocr_path_ruled_line_regions_flow_through_and_disable_heuristic(
     the legacy space-heuristic must NOT also run on the OCR text."""
     document = await make_document(status=DocumentStatus.QUEUED)
 
-    async def fake_extract_text(filename: str, data: bytes) -> OcrResult:
+    async def fake_extract_text(filename: str, data: bytes, **kwargs) -> OcrResult:
         return OcrResult(
             # this text has space-aligned lines the old heuristic WOULD have
             # turned into a bogus table - it must not, on the OCR path
@@ -257,7 +410,7 @@ async def test_ocr_failure_marks_document_failed_and_never_leaves_it_processing(
 ):
     document = await make_document(status=DocumentStatus.QUEUED)
 
-    async def boom(filename: str, data: bytes) -> str:
+    async def boom(filename: str, data: bytes, **kwargs) -> str:
         raise OCRError("tesseract exploded")
 
     monkeypatch.setattr("app.worker.ocr.extract_text", boom)
@@ -282,7 +435,7 @@ async def test_ocr_timeout_marks_document_failed_with_clear_message(
     unhandled exception or leave the document stuck in PROCESSING."""
     document = await make_document(status=DocumentStatus.QUEUED)
 
-    async def hangs_then_times_out(filename: str, data: bytes) -> str:
+    async def hangs_then_times_out(filename: str, data: bytes, **kwargs) -> str:
         raise httpx.ReadTimeout("simulated slow OCR service response")
 
     monkeypatch.setattr("app.worker.ocr.extract_text", hangs_then_times_out)

@@ -115,3 +115,102 @@ async def test_export_endpoint_survives_missing_crop_file(client, make_document)
     assert resp.status_code == 200
     doc = DocxDocument(io.BytesIO(resp.content))
     assert any("image data unavailable" in p.text for p in doc.paragraphs)
+
+
+# --- WP-G: pixel-perfect PDF export --------------------------------------
+# All PDF/image byte payloads below are fabricated in-test, never copied
+# from a real document.
+
+_FAKE_NATIVE_PDF = b"%PDF-1.7\n% fabricated 'native' original for tests\n%%EOF"
+_FAKE_SEARCHABLE_PDF = b"%PDF-1.5\n% fabricated searchable pdf for tests\n%%EOF"
+
+
+async def test_export_pdf_native_passthrough_streams_original(client, make_document):
+    doc_id = uuid.uuid4()
+    storage = get_storage_backend()
+    raw_key = f"{doc_id}/original.pdf"
+    storage.save(raw_key, _FAKE_NATIVE_PDF)
+
+    document = await make_document(
+        status=DocumentStatus.DONE, structured_data=STRUCTURED,
+        raw_file_path=raw_key, text_source="native_pdf", ocr_lang="eng",
+    )
+    resp = await client.get(f"/documents/{document.id}/export", params={"format": "pdf"})
+    assert resp.status_code == 200
+    assert resp.headers["content-type"] == "application/pdf"
+    assert resp.content == _FAKE_NATIVE_PDF          # byte-for-byte, no reconstruction
+
+
+async def test_export_pdf_ocr_streams_prebuilt_searchable_pdf(client, make_document):
+    doc_id = uuid.uuid4()
+    storage = get_storage_backend()
+    sp_key = f"{doc_id}/searchable.pdf"
+    storage.save(sp_key, _FAKE_SEARCHABLE_PDF)
+
+    document = await make_document(
+        status=DocumentStatus.DONE, structured_data=STRUCTURED,
+        text_source="ocr", ocr_lang="eng", searchable_pdf_key=sp_key,
+    )
+    resp = await client.get(f"/documents/{document.id}/export", params={"format": "pdf"})
+    assert resp.status_code == 200
+    assert resp.content == _FAKE_SEARCHABLE_PDF
+
+
+async def test_export_pdf_falls_back_to_structured_text_when_no_text_source(client, make_document):
+    """Pre-WP-G document (text_source NULL) -> legacy structured-text PDF,
+    generated, not a stored original."""
+    document = await make_document(status=DocumentStatus.DONE, structured_data=STRUCTURED)
+    resp = await client.get(f"/documents/{document.id}/export", params={"format": "pdf"})
+    assert resp.status_code == 200
+    assert resp.content.startswith(b"%PDF")
+    assert resp.content not in (_FAKE_NATIVE_PDF, _FAKE_SEARCHABLE_PDF)
+
+
+async def test_export_pdf_falls_back_when_native_original_missing(client, make_document):
+    document = await make_document(
+        status=DocumentStatus.DONE, structured_data=STRUCTURED,
+        raw_file_path="gone/missing.pdf", text_source="native_pdf",
+    )
+    resp = await client.get(f"/documents/{document.id}/export", params={"format": "pdf"})
+    assert resp.status_code == 200
+    assert resp.content.startswith(b"%PDF")           # fell back to render_pdf, no 500
+
+
+async def test_export_pdf_falls_back_when_searchable_pdf_key_dangling(client, make_document):
+    document = await make_document(
+        status=DocumentStatus.DONE, structured_data=STRUCTURED,
+        text_source="ocr", searchable_pdf_key="gone/missing.pdf",
+    )
+    resp = await client.get(f"/documents/{document.id}/export", params={"format": "pdf"})
+    assert resp.status_code == 200
+    assert resp.content.startswith(b"%PDF")
+
+
+async def test_export_pdf_native_passthrough_ignores_non_pdf_original(client, make_document):
+    """Defensive: text_source=native_pdf but the stored original isn't a PDF
+    -> don't stream a mislabelled file, fall back to the text renderer."""
+    doc_id = uuid.uuid4()
+    storage = get_storage_backend()
+    raw_key = f"{doc_id}/original.bin"
+    storage.save(raw_key, _png(10, 10))
+
+    document = await make_document(
+        status=DocumentStatus.DONE, structured_data=STRUCTURED,
+        raw_file_path=raw_key, text_source="native_pdf",
+    )
+    resp = await client.get(f"/documents/{document.id}/export", params={"format": "pdf"})
+    assert resp.status_code == 200
+    assert resp.content.startswith(b"%PDF")
+    assert resp.content != _png(10, 10)
+
+
+async def test_export_docx_unaffected_by_text_source(client, make_document):
+    """WP-G touches only format=pdf; docx/xlsx still use the structured
+    renderer regardless of text_source."""
+    document = await make_document(
+        status=DocumentStatus.DONE, structured_data=STRUCTURED,
+        text_source="native_pdf", raw_file_path="whatever/x.pdf",
+    )
+    resp = await client.get(f"/documents/{document.id}/export", params={"format": "docx"})
+    assert resp.status_code == 200
+    assert resp.content.startswith(b"PK")

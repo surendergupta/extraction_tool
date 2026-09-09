@@ -108,6 +108,9 @@ async def make_document(db_session: AsyncSession):
         extracted_text: str | None = None,
         structured_data: dict | None = None,
         image_regions: list | None = None,
+        text_source: str | None = None,
+        ocr_lang: str | None = None,
+        searchable_pdf_key: str | None = None,
         error_message: str | None = None,
     ) -> Document:
         document_id = uuid.uuid4()
@@ -124,6 +127,9 @@ async def make_document(db_session: AsyncSession):
             extracted_text=extracted_text,
             structured_data=structured_data,
             image_regions=image_regions,
+            text_source=text_source,
+            ocr_lang=ocr_lang,
+            searchable_pdf_key=searchable_pdf_key,
             error_message=error_message,
         )
         db_session.add(document)

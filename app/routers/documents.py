@@ -91,6 +91,37 @@ async def get_document(document_id: uuid.UUID, db: AsyncSession = Depends(get_db
     return DocumentOut.model_validate(document)
 
 
+def _pixel_perfect_pdf(document: Document) -> bytes | None:
+    """WP-G: the visual-fidelity PDF for a document, or None to tell the
+    caller to fall back to the legacy structured-text PDF.
+
+      * text_source == "native_pdf": the uploaded file already IS the exact
+        original layout - stream it back verbatim (fonts, images, tables,
+        everything). No reconstruction.
+      * text_source == "ocr": the pre-generated Tesseract searchable PDF
+        (original page image + invisible text layer), built during the OCR
+        worker step and stored at `searchable_pdf_key`.
+      * text_source is NULL (documents processed before WP-G, or a failed
+        searchable-PDF build): None -> legacy structured-text PDF.
+    """
+    storage = get_storage_backend()
+
+    if document.text_source == "native_pdf":
+        try:
+            raw = storage.read(document.raw_file_path)
+        except Exception:  # noqa: BLE001 - missing original -> fall back
+            return None
+        return raw if raw[:4] == b"%PDF" else None
+
+    if document.text_source == "ocr" and document.searchable_pdf_key:
+        try:
+            return storage.read(document.searchable_pdf_key)
+        except Exception:  # noqa: BLE001 - missing artifact -> fall back
+            return None
+
+    return None
+
+
 @router.get("/{document_id}/export")
 async def export_document(
     document_id: uuid.UUID,
@@ -105,6 +136,19 @@ async def export_document(
             status_code=status.HTTP_409_CONFLICT,
             detail=f"Document is not ready for export (status={document.status.value})",
         )
+
+    # WP-G: PDF is the visual-fidelity format. Native-PDF documents export
+    # as a pass-through of the untouched original; scanned/OCR documents as
+    # the Tesseract searchable PDF. Only if neither is available do we fall
+    # through to the legacy structured-text PDF renderer below.
+    if format == "pdf":
+        pixel_perfect = _pixel_perfect_pdf(document)
+        if pixel_perfect is not None:
+            return Response(
+                content=pixel_perfect,
+                media_type=export.content_type_for("pdf"),
+                headers={"Content-Disposition": f'attachment; filename="{document.id}.pdf"'},
+            )
 
     # WP-F: resolve the WP-B extracted-image crop bytes so the docx/xlsx
     # renderers can embed them. A missing/unreadable crop is skipped, not

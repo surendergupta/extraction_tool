@@ -1,10 +1,11 @@
 import functools
 
 import pytesseract
-from fastapi import FastAPI, File, HTTPException, Query, UploadFile, status
+from fastapi import FastAPI, File, HTTPException, Query, Response, UploadFile, status
 from pydantic import BaseModel
 
 from app.ocr import OCRError, extract_text_from_bytes
+from app.searchable_pdf import SearchablePdfError, build_searchable_pdf
 
 app = FastAPI(title="Sense_tool OCR Service")
 
@@ -138,7 +139,11 @@ async def ocr(
 
     try:
         result = extract_text_from_bytes(
-            file.filename or "upload", data, psm=psm, lang=lang, extract_images=extract_images
+            file.filename or "upload",
+            data,
+            psm=psm,
+            lang=lang,
+            extract_images=extract_images,
         )
     except OCRError as exc:
         raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(exc)) from exc
@@ -150,3 +155,45 @@ async def ocr(
         text_source=result.text_source,
         images=[img.to_payload() for img in result.images],
     )
+
+
+@app.post(
+    "/searchable-pdf",
+    responses={200: {"content": {"application/pdf": {}}}},
+)
+async def searchable_pdf(
+    file: UploadFile = File(...),
+    lang: str = Query(
+        "eng",
+        pattern=_LANG_PATTERN,
+        description=(
+            "Tesseract language(s) for the invisible text layer - same syntax "
+            "and support as /ocr's `lang`. Thread the same value the document "
+            "was OCR'd with so the layer matches."
+        ),
+    ),
+) -> Response:
+    """WP-G: return a Tesseract *searchable PDF* - the ORIGINAL uploaded
+    image / scanned page(s) with an invisible, word-positioned OCR text
+    layer. The visible layer is a byte-faithful copy of the upload.
+
+    This is a standalone job on purpose: the main app calls it from a
+    follow-up Arq task *after* text extraction, so a failure here can never
+    affect `Document.extracted_text`. It runs its own Tesseract pass
+    (`--oem 1 --psm 6`) on the un-preprocessed image - see
+    app/searchable_pdf.py for why the two passes are separate.
+    """
+    _validate_lang(lang)
+
+    data = await file.read()
+    if not data:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Uploaded file is empty")
+
+    try:
+        pdf = build_searchable_pdf(file.filename or "upload", data, lang)
+    except SearchablePdfError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(exc)
+        ) from exc
+
+    return Response(content=pdf, media_type="application/pdf")

@@ -19,6 +19,7 @@ import uuid
 from pathlib import Path
 
 import httpx
+from arq import func
 from arq.connections import RedisSettings
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
@@ -31,6 +32,14 @@ from app.storage import get_storage_backend
 logger = logging.getLogger("sense_tool.worker")
 
 settings = get_settings()
+
+# The Tesseract language string used for OCR. English-only for now; WP-A's
+# opt-in multi-script modes ("eng+guj", "eng+nep") are plumbed end to end
+# but nothing wires a per-document choice yet. `run_ocr_extraction` takes it
+# as an argument so that wiring is a one-line change later, and it is
+# persisted to `Document.ocr_lang` so a searchable PDF (WP-G) can be
+# regenerated with a matching text layer.
+_DEFAULT_OCR_LANG = "eng"
 
 
 async def startup(ctx: dict) -> None:
@@ -80,7 +89,18 @@ def _persist_image_regions(storage, document_id, images: list) -> list[dict] | N
     return meta
 
 
-async def run_ocr_extraction(ctx: dict, document_id: str) -> None:
+def _persist_searchable_pdf(storage, document_id, pdf: bytes) -> str:
+    """WP-G: save the Tesseract searchable PDF next to the raw file and
+    return its storage key."""
+    key = f"{document_id}/searchable.pdf"
+    storage.save(key, pdf)
+    logger.info("document %s: stored searchable PDF (%d bytes)", document_id, len(pdf))
+    return key
+
+
+async def run_ocr_extraction(
+    ctx: dict, document_id: str, lang: str = _DEFAULT_OCR_LANG
+) -> None:
     sessionmaker = ctx["sessionmaker"]
     async with sessionmaker() as session:
         document = await session.get(Document, uuid.UUID(str(document_id)))
@@ -95,9 +115,15 @@ async def run_ocr_extraction(ctx: dict, document_id: str) -> None:
             storage = get_storage_backend()
             data = storage.read(document.raw_file_path)
             filename = Path(document.raw_file_path).name
-            result = await ocr.extract_text(filename, data)
+            result = await ocr.extract_text(filename, data, lang=lang)
 
             document.extracted_text = result.text
+            # WP-G: record which path produced the text and the language
+            # used, so /export can pick the right PDF strategy (native ->
+            # pass through the original file; ocr -> the searchable PDF) and
+            # so the searchable-PDF job can match its text layer's language.
+            document.text_source = result.text_source
+            document.ocr_lang = lang
             # WP-B: persist extracted image/photo/chart regions. Crop bytes
             # go to the storage backend next to the raw file; only metadata
             # (incl. the storage key) lands in the DB. Best-effort - a
@@ -136,6 +162,56 @@ async def run_ocr_extraction(ctx: dict, document_id: str) -> None:
         result.text_source,
     )
 
+    # WP-G: the searchable PDF (for pixel-perfect PDF export of scanned
+    # documents) is built by a SEPARATE follow-up job, on its own Tesseract
+    # pass - decoupled from text extraction so it can never block or corrupt
+    # `extracted_text`. Only the rasterize+OCR path needs one; a native-PDF
+    # document exports as a pass-through of its own file.
+    if result.text_source == "ocr":
+        await redis.enqueue_job(
+            "run_searchable_pdf_generation", str(document_id), lang
+        )
+
+
+async def run_searchable_pdf_generation(
+    ctx: dict, document_id: str, lang: str = _DEFAULT_OCR_LANG
+) -> None:
+    """WP-G follow-up job: build the Tesseract searchable PDF for a scanned
+    document and record it at `Document.searchable_pdf_key`.
+
+    Entirely best-effort and isolated: any failure is logged and swallowed
+    (no retry, no status change). `extracted_text`, `structured_data`,
+    `status` and export availability are unaffected - the /export endpoint
+    already falls back to the structured-text PDF when `searchable_pdf_key`
+    is NULL.
+    """
+    sessionmaker = ctx["sessionmaker"]
+    try:
+        async with sessionmaker() as session:
+            document = await session.get(Document, uuid.UUID(str(document_id)))
+            if document is None:
+                logger.warning("document %s not found for searchable-PDF step", document_id)
+                return
+            if not document.raw_file_path:
+                logger.warning("document %s has no raw file for searchable-PDF step", document_id)
+                return
+
+            storage = get_storage_backend()
+            data = storage.read(document.raw_file_path)
+            filename = Path(document.raw_file_path).name
+            pdf = await ocr.generate_searchable_pdf(filename, data, lang=lang)
+
+            document.searchable_pdf_key = _persist_searchable_pdf(storage, document.id, pdf)
+            await session.commit()
+            logger.info("document %s: searchable PDF ready", document_id)
+    except Exception as exc:  # noqa: BLE001 - best-effort; never affect the main pipeline
+        logger.warning(
+            "document %s: searchable-PDF generation failed (leaving key NULL, "
+            "export falls back to the structured-text PDF): %s",
+            document_id,
+            exc,
+        )
+
 
 async def run_structure_parsing(
     ctx: dict,
@@ -169,7 +245,16 @@ async def run_structure_parsing(
 
 
 class WorkerSettings:
-    functions = [run_ocr_extraction, run_structure_parsing]
+    functions = [
+        run_ocr_extraction,
+        run_structure_parsing,
+        # WP-G: its own generous job timeout - it runs a fresh Tesseract
+        # pass per page (~21s/page worst case measured), well past arq's
+        # 300s default for a large multi-page scan. It is isolated and
+        # best-effort, so hitting this ceiling just leaves searchable_pdf_key
+        # NULL (export falls back), it does not fail the document.
+        func(run_searchable_pdf_generation, timeout=960),
+    ]
     on_startup = startup
     on_shutdown = shutdown
     redis_settings = RedisSettings.from_dsn(settings.redis_url)

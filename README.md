@@ -58,7 +58,7 @@ one pipeline, not four unrelated projects.
 | OCR              | Separate service (see below): pdfplumber native-PDF-text-first (+ table extraction), else OpenCV preprocessing + Tesseract (LSTM; English default, opt-in `eng+guj` / `eng+nep` multi-script) |
 | Database         | PostgreSQL, SQLAlchemy 2.0 (async) + Alembic         |
 | Object storage   | Local filesystem, behind a `StorageBackend` interface |
-| Export           | `pypdf`, `python-docx`, `openpyxl`, `pillow` (image embedding) |
+| Export           | PDF: native-PDF pass-through, or a Tesseract searchable PDF for scans (WP-G). DOCX/XLSX: `python-docx` / `openpyxl` structured recreation + `pillow` image embedding. `pypdf` merges searchable-PDF pages |
 | Search           | Postgres full-text search (generated `tsvector` + GIN index) |
 
 ## Data model
@@ -248,7 +248,10 @@ comment above `app/services/structure.py::_is_header_line`.
   multi-script OCR** for Gujarati and Nepali/Devanagari. Omitting `lang` is
   byte-for-byte the old English-only path. Response:
   `{"text": str, "text_source": "native_pdf"|"ocr", "tables": [...],
-  "table_regions": [...], "images": [...]}`.
+  "table_regions": [...], "images": [...]}`. (WP-G's searchable PDF is a
+  **separate** endpoint, `POST /searchable-pdf`, called by its own
+  follow-up job — `/ocr` has no searchable-PDF coupling; see "PDF (WP-G)"
+  under Export and `ocr_service/README.md`.)
   `tables` is pdfplumber's raw per-table row/cell **grid** — native-PDF
   path only, `[]` otherwise. `table_regions` (WP-D) is the rasterize+OCR
   path's ruled-line table **regions** — `{bbox, region_text, source:
@@ -341,11 +344,66 @@ general failure handler) and sets `status=FAILED` with
 `PROCESSING`. Covered by
 `tests/test_pipeline.py::test_ocr_timeout_marks_document_failed_with_clear_message`.
 
-## Export (WP-F)
+## Export
 
-`GET /documents/{id}/export?format=docx|xlsx|pdf` renders `structured_data`
-plus the WP-B extracted images. Best-effort *structured* export — not
-pixel-perfect layout ([app/services/export.py](app/services/export.py)).
+`GET /documents/{id}/export?format=pdf|docx|xlsx`.
+
+**Two philosophies, by format:**
+
+| format | what you get |
+|---|---|
+| **`pdf`** (WP-G) | **Visual fidelity.** Native-PDF documents export as a byte-for-byte pass-through of the uploaded original (exact fonts, layout, images, tables — nothing is reconstructed). Scanned/OCR documents export as a **Tesseract searchable PDF**: the original page image(s) with an invisible, word-positioned OCR text layer, so the visual *is* the original and the text is now selectable/searchable. |
+| **`docx` / `xlsx`** (WP-F) | **Best-effort structured recreation** from `structured_data` + the WP-B images ([app/services/export.py](app/services/export.py)) — *not* an exact-layout clone. |
+
+### PDF (WP-G) — pixel-perfect
+
+The right output for `format=pdf` is chosen from `Document.text_source`
+(persisted by the OCR worker step, migration `0003`):
+
+| `text_source` | PDF export | how |
+|---|---|---|
+| `native_pdf` | the uploaded file, streamed verbatim | the source PDF already *is* the exact original layout — no rebuild. `_pixel_perfect_pdf` in [app/routers/documents.py](app/routers/documents.py) reads `raw_file_path` from storage and returns it as-is. |
+| `ocr` | a pre-generated Tesseract searchable PDF | built by a **separate follow-up job** after OCR (see below), from the **original** page image(s) + an invisible OCR text layer, stored at `searchable_pdf_key`, streamed on export. WP-B extracted images need no separate embedding — they are already in the page raster. If the job hasn't finished or failed, `searchable_pdf_key` is `NULL` and export falls back. |
+| `NULL` (pre-WP-G rows, a missing original, or a not-yet/failed searchable-PDF job) | the legacy structured-text PDF (`render_pdf`) | a plain flatten of `structured_data` — kept only as a fallback. |
+
+**Two separate Tesseract passes — and why.** An A/B evaluation on 7 real
+scanned documents (DEXA printout photo, Gulf Gujarati/Nepali forms,
+workplace lab report, a heavily skewed photo, two digital DEXA renders)
+compared the tuned primary pass against a single un-preprocessed pass and
+found the un-preprocessed one **measurably worse on real scans**: a lab
+report lost its units and reference-range columns, a DEXA printout lost its
+results-table row/value association, and a skewed photo collapsed to two
+tokens — while reporting *higher* confidence (fewer, easier words). So:
+
+- **Primary path — unchanged.** `run_ocr_extraction` still feeds
+  `Document.extracted_text` / structure / search from the OpenCV
+  Otsu/deskew + `--oem 1 --psm 6` pass, exactly as before WP-G. It carries
+  no searchable-PDF coupling at all.
+- **Searchable-PDF path — new, async, isolated.** `run_ocr_extraction`
+  enqueues a follow-up Arq job, `run_searchable_pdf_generation`, only for
+  `text_source == "ocr"`. It calls the OCR service's dedicated
+  `POST /searchable-pdf` ([ocr_service/app/searchable_pdf.py](ocr_service/app/searchable_pdf.py)),
+  which runs **its own** Tesseract pass per page via `run_tesseract` with
+  `--oem 1 --psm 6` (pinned like the primary path — `run_and_get_multiple_output`
+  takes no config, so it isn't used) on the **un-preprocessed** original
+  image. Tesseract always renders whatever it OCRs as the PDF's visible
+  layer, so this pass *must* see the original; pinning psm keeps the
+  invisible text layer's page segmentation sane for tabular scans. The
+  deskew/binarise difference from the primary path is the one unavoidable
+  gap, and it only affects the invisible layer, never `extracted_text`.
+- **Failure is a non-event.** Any failure in the follow-up job (or its
+  960s job timeout) is logged and swallowed — `extracted_text`, `status`,
+  `structured_data` and export are untouched; `searchable_pdf_key` stays
+  `NULL` and `format=pdf` serves the structured-text fallback.
+
+Multi-page scanned PDFs are re-rasterised (poppler) and the per-page PDFs
+merged in page order with `pypdf`. `lang` is threaded from
+`run_ocr_extraction` through the job to `/searchable-pdf` (and persisted as
+`Document.ocr_lang`), so an `eng+guj` / `eng+nep` run produces a correct
+**Unicode** invisible layer in the matching script — verified in the
+OCR-service test suite, not assumed.
+
+### DOCX / XLSX (WP-F) — structured recreation
 
 **Tables — two shapes, branched on `source`** (see the "Table extraction"
 note above):
@@ -370,9 +428,8 @@ order, not exact position.
 - **XLSX**: a dedicated `Figures` sheet (one labelled block per image) —
   anchoring images next to their content is impractical in XLSX's grid
   model, so a summary sheet is used deliberately, not as a fallback.
-- **PDF**: text only — image *bytes* are not embedded (PDF layout is a
-  later WP); the PDF lists the figure captions and includes the
-  `ruled_line_region` text so nothing is silently lost.
+
+(For a visually faithful copy of the source, use `format=pdf` — WP-G.)
 
 `pillow` is a runtime dependency (openpyxl needs it to embed images).
 Verified end-to-end on LabReport-1.pdf (2 native grids + all 6 embedded
@@ -391,11 +448,11 @@ crash and no empty/broken elements.
 - `GET /documents/search?q=...&limit=&offset=` — Postgres full-text search
   over `extracted_text`, ranked by `ts_rank`, with a highlighted snippet per
   result.
-- `GET /documents/{id}/export?format=pdf|docx|xlsx` — renders
-  `structured_data` **and the WP-B extracted images** into the requested
-  format (best-effort structured export, not pixel-perfect layout — that's
-  a later WP for PDF). `409` if the document isn't `DONE` yet. See "Export"
-  below.
+- `GET /documents/{id}/export?format=pdf|docx|xlsx` — `pdf` is visual-
+  fidelity (WP-G): native-PDF pass-through, or a Tesseract searchable PDF
+  for scans. `docx` / `xlsx` are a best-effort structured recreation of
+  `structured_data` **and the WP-B extracted images**. `409` if the
+  document isn't `DONE` yet. See "Export" below.
 - `GET /health` — liveness check.
 
 Interactive API docs: `http://localhost:8000/docs`.
@@ -497,14 +554,22 @@ Coverage includes:
 - `tests/test_intake.py` — upload validation, storage, DB row creation, job
   enqueue, `GET /documents/{id}`.
 - `tests/test_pipeline.py` — `run_ocr_extraction` / `run_structure_parsing`
-  status transitions, the **FAILED path** for both steps, and the
-  never-stuck-in-PROCESSING guarantee.
+  status transitions, the **FAILED path** for both steps, the
+  never-stuck-in-PROCESSING guarantee, and (WP-G) that the OCR step
+  persists `text_source` / `ocr_lang` and enqueues a separate
+  `run_searchable_pdf_generation` job (OCR path only), that the job stores
+  `searchable_pdf_key`, threads `lang`, and that any failure in it is fully
+  isolated — no change to status / `extracted_text` / export.
 - `tests/test_end_to_end.py` — a real `arq.worker.Worker` (burst mode)
   draining the actual Redis queue after a real `POST /documents/intake`,
   both for the happy path and the OCR-failure path.
 - `tests/test_search.py` — full-text search ranking/snippets/empty results.
 - `tests/test_export.py` — export endpoint: `404`/`409`/`422` handling,
-  and image crops flowing from storage into the generated docx.
+  image crops flowing from storage into the generated docx, and the WP-G
+  PDF branches — native-PDF byte-for-byte pass-through, `ocr` docs
+  streaming the pre-built searchable PDF, and the fallback to the
+  structured-text PDF when `text_source` is `NULL` or the artifact is
+  missing.
 - `tests/test_export_render.py` — pure renderers: native-grid → real Word
   table / real cells; `ruled_line_region` → labelled text (never a fake
   table); all images embedded with caption hints; empty document exports
@@ -527,9 +592,12 @@ image extraction) run anywhere (only need `pdfplumber` + `reportlab`, no
 Tesseract). The tests that actually invoke Tesseract auto-skip if a
 `tesseract` binary isn't on `PATH` — that includes the Gujarati/Nepali
 multi-script tests (which additionally skip without the `guj`/`nep`
-tessdata and a matching Lohit font) and the WP-B scanned-page region
-detection tests. All of them run for real inside the `ocr` Docker image,
-where the full suite is green.
+tessdata and a matching Lohit font), the WP-B scanned-page region
+detection tests, and the WP-G searchable-PDF tests (searchable PDF from a
+scanned image / multi-page order preservation / `null` on the native path
+/ correct Unicode invisible layer for `eng+guj` and `eng+nep`). All of
+them run for real inside the `ocr` Docker image, where the full suite is
+green.
 
 ## Storage abstraction
 
