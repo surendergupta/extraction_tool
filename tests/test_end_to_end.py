@@ -37,7 +37,7 @@ async def _run_worker_burst() -> None:
 async def test_intake_through_real_queue_reaches_done(
     client, db_session, png_bytes, monkeypatch
 ):
-    async def fake_extract_text(filename: str, data: bytes) -> OcrResult:
+    async def fake_extract_text(filename: str, data: bytes, **kwargs) -> OcrResult:
         return OcrResult(text="IMPRESSION:\nNormal chest x-ray.")
 
     monkeypatch.setattr("app.worker.ocr.extract_text", fake_extract_text)
@@ -62,7 +62,7 @@ async def test_intake_through_real_queue_reaches_done(
 async def test_intake_through_real_queue_marks_failed_on_ocr_error(
     client, db_session, png_bytes, monkeypatch
 ):
-    async def boom(filename: str, data: bytes) -> str:
+    async def boom(filename: str, data: bytes, **kwargs) -> str:
         raise RuntimeError("ocr backend unavailable")
 
     monkeypatch.setattr("app.worker.ocr.extract_text", boom)

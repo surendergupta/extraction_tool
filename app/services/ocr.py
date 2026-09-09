@@ -116,6 +116,47 @@ async def extract_text(filename: str, data: bytes, lang: str | None = None) -> O
     )
 
 
+async def generate_searchable_pdf(
+    filename: str, data: bytes, lang: str | None = None
+) -> bytes:
+    """WP-G: ask the OCR service for a Tesseract searchable PDF (original
+    page image(s) + invisible OCR text layer) via its `/searchable-pdf`
+    endpoint.
+
+    Called from a follow-up Arq job, never inline with text extraction, so
+    a failure here cannot affect `Document.extracted_text`. `lang` should be
+    the same value the document was OCR'd with so the invisible layer
+    matches (`Document.ocr_lang`). Raises OCRError on any service failure;
+    the caller treats that as "no searchable PDF" and leaves the key NULL.
+    """
+    settings = get_settings()
+    params = {"lang": lang} if lang else None
+    timeout = httpx.Timeout(
+        connect=settings.ocr_connect_timeout_seconds,
+        read=settings.searchable_pdf_read_timeout_seconds,
+        write=settings.ocr_write_timeout_seconds,
+        pool=settings.ocr_pool_timeout_seconds,
+    )
+
+    async with httpx.AsyncClient(timeout=timeout) as client:
+        try:
+            response = await client.post(
+                f"{settings.ocr_service_url}/searchable-pdf",
+                files={"file": (filename, data)},
+                params=params,
+            )
+        except httpx.HTTPError as exc:
+            raise OCRError(f"searchable-PDF request failed: {exc}") from exc
+
+    if response.status_code != 200:
+        raise OCRError(
+            f"searchable-PDF service returned {response.status_code}: {response.text[:300]}"
+        )
+    if not response.content:
+        raise OCRError("searchable-PDF service returned an empty body")
+    return response.content
+
+
 def _parse_table_regions(raw: list[dict]) -> list[RuledTableRegion]:
     regions: list[RuledTableRegion] = []
     for item in raw:

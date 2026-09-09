@@ -1,9 +1,14 @@
 """Render a Document's structured_data (+ WP-B extracted images) into
 pdf/docx/xlsx bytes.
 
-Best-effort STRUCTURED export, not pixel-perfect layout (that is PDF's job
-in WP-G). Two things this module must get right, both consumed from data
-the pipeline already produced - it changes no OCR/detection logic:
+Best-effort STRUCTURED export. The docx/xlsx renderers here are the primary
+output for those formats. `render_pdf` is now only a FALLBACK: WP-G made
+PDF the visual-fidelity format, served by the /export router directly
+(native-PDF pass-through, or the Tesseract searchable PDF) - `render_pdf`
+runs only for pre-WP-G documents or when that artifact is missing.
+
+Two things this module must get right, both consumed from data the pipeline
+already produced - it changes no OCR/detection logic:
 
   * `structured_data["tables"]` entries have MORE THAN ONE SHAPE and must
     be branched on `source`:
@@ -267,14 +272,17 @@ def render_xlsx(source: str, structured_data: dict[str, Any] | None, images: lis
     return buf.getvalue()
 
 
-# --------------------------------------------------------------- PDF (text dump)
+# ------------------------------------------------ PDF (structured-text FALLBACK)
+# Used only when the /export router has no pixel-perfect PDF for a document
+# (pre-WP-G rows, or a missing original/searchable artifact). The visual-
+# fidelity PDF paths - native pass-through and the Tesseract searchable PDF -
+# live in the router and the OCR worker step, not here.
 def _structured_lines(
     source: str, structured_data: dict[str, Any] | None, images: list[dict] | None = None
 ) -> list[str]:
-    """Flatten structured_data into text lines for the (plain-text) PDF
-    renderer. PDF layout/image embedding is WP-G's job - here we just make
-    sure the ruled-line region text and the image count are not silently
-    lost from the PDF."""
+    """Flatten structured_data into text lines for the fallback plain-text
+    PDF renderer - make sure the ruled-line region text and the image count
+    are not silently lost when this fallback runs."""
     lines: list[str] = [f"Source: {source}", ""]
     structured_data = structured_data or {}
     images = images or []

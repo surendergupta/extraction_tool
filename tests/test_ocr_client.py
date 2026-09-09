@@ -134,3 +134,59 @@ async def test_extract_text_native_pdf_text_source_passthrough(monkeypatch):
     assert result.text_source == "native_pdf"
     assert result.table_regions == []
     assert result.tables == [[["A", "B"], ["1", "2"]]]
+
+
+async def test_extract_text_never_sends_searchable_pdf_param(monkeypatch):
+    """WP-G two-pass: /ocr has no searchable-PDF coupling any more."""
+    seen = _capturing_client(monkeypatch)
+    await ocr.extract_text("scan.png", b"bytes", lang="eng+guj")
+    assert "searchable_pdf" not in seen["params"]
+
+
+# --- WP-G: generate_searchable_pdf client (POST /searchable-pdf) -----------
+
+
+def _pdf_client(monkeypatch, *, status_code=200, content=b"%PDF-1.5 fake\n%%EOF"):
+    """MockTransport that records the request and returns raw PDF bytes."""
+    seen = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["url"] = str(request.url)
+        seen["path"] = request.url.path
+        seen["params"] = dict(request.url.params)
+        return httpx.Response(status_code, content=content)
+
+    transport = httpx.MockTransport(handler)
+    monkeypatch.setattr(
+        ocr.httpx, "AsyncClient", functools.partial(httpx.AsyncClient, transport=transport)
+    )
+    return seen
+
+
+async def test_generate_searchable_pdf_posts_and_returns_bytes(monkeypatch):
+    pdf = b"%PDF-1.5 fabricated searchable pdf\n%%EOF"
+    seen = _pdf_client(monkeypatch, content=pdf)
+
+    out = await ocr.generate_searchable_pdf("scan.png", b"rawbytes")
+
+    assert out == pdf
+    assert seen["path"] == "/searchable-pdf"
+    assert "lang" not in seen["params"]
+
+
+async def test_generate_searchable_pdf_threads_lang(monkeypatch):
+    seen = _pdf_client(monkeypatch)
+    await ocr.generate_searchable_pdf("scan.png", b"rawbytes", lang="eng+nep")
+    assert seen["params"]["lang"] == "eng+nep"
+
+
+async def test_generate_searchable_pdf_raises_on_service_error(monkeypatch):
+    _pdf_client(monkeypatch, status_code=422, content=b"boom")
+    with pytest.raises(ocr.OCRError):
+        await ocr.generate_searchable_pdf("scan.png", b"rawbytes")
+
+
+async def test_generate_searchable_pdf_raises_on_empty_body(monkeypatch):
+    _pdf_client(monkeypatch, status_code=200, content=b"")
+    with pytest.raises(ocr.OCRError):
+        await ocr.generate_searchable_pdf("scan.png", b"rawbytes")

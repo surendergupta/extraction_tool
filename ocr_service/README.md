@@ -121,6 +121,44 @@ clinical payload. If native-script letterhead/prose is specifically
 needed, run it as a *second* pass over a cropped native-script region,
 alongside — not instead of — the `eng` pass.
 
+## Searchable PDF (`POST /searchable-pdf`, WP-G)
+
+`POST /searchable-pdf` (multipart `file`, optional `lang`) returns
+`application/pdf`: the **original page image(s)** with an invisible,
+word-positioned OCR text layer — a PDF whose visual *is* the scan and whose
+text is now selectable/searchable. It is what Sense_tool's `format=pdf`
+export streams for scanned documents (native-PDF documents export their own
+file untouched — that's the export router's job, not this endpoint's).
+
+- **A standalone endpoint on its own Tesseract pass — on purpose.** The
+  main app calls it from a *follow-up* Arq job (`run_searchable_pdf_generation`)
+  **after** text extraction, so a failure here can never touch
+  `Document.extracted_text`, `status`, or the pipeline outcome. `/ocr` has
+  no searchable-PDF coupling at all.
+- **Why a second pass, not one.** An A/B evaluation on 7 real scanned
+  documents (DEXA printout photo, Gulf Gujarati/Nepali forms, workplace lab
+  report, a heavily skewed photo, two digital DEXA renders) compared the
+  tuned primary `/ocr` pass against a single un-preprocessed pass feeding
+  `extracted_text`. The un-preprocessed one was **measurably worse on real
+  scans** — a lab report lost its units/reference-range columns, a DEXA
+  printout lost its results-table row↔value association, a skewed photo
+  collapsed to two tokens — while reporting *higher* confidence (fewer,
+  easier words). So the two are separate: `/ocr` keeps its OpenCV
+  Otsu/deskew + `--oem 1 --psm 6` pipeline, byte-for-byte unchanged.
+- **This pass:** `run_tesseract` (directly — `run_and_get_multiple_output`
+  takes no config) with `--oem 1 --psm 6` in one `tesseract … txt pdf`
+  invocation per page, on the **un-preprocessed** original image. Tesseract
+  always renders whatever it OCRs as the visible PDF layer, so it must see
+  the original; pinning psm keeps the invisible layer's segmentation sane
+  for tabular scans. The deskew/binarise difference from the primary path
+  is the one unavoidable gap and affects only the invisible layer.
+- **Multi-page** scanned PDFs are re-rasterised (poppler) and the per-page
+  PDFs merged in page order with `pypdf`.
+- **`lang` is honoured.** `eng`, `eng+guj`, `eng+nep`, … produce an
+  invisible text layer in the matching script, written as proper Unicode
+  (selectable and searchable), verified in the test suite. Pass the same
+  value the document was OCR'd with (`Document.ocr_lang`).
+
 ## Image / photo / chart region extraction (`images`)
 
 `/ocr` responses carry an `images` array: embedded raster images (native-PDF

@@ -716,3 +716,163 @@ async def test_ocr_eng_nep_recognises_devanagari_script(client):
     assert text.strip(), "combined-mode OCR returned nothing"
     deva_chars = _count_in_range(text, _DEVA_RANGE)
     assert deva_chars >= 5, f"expected Devanagari-script output, got {text!r}"
+
+
+# --- WP-G: POST /searchable-pdf ------------------------------------------
+# Standalone endpoint (WP-G two-pass architecture): its own Tesseract pass
+# (`--oem 1 --psm 6`) on the ORIGINAL image, returning raw application/pdf.
+# Every marker string / image below is fabricated in this file - none of it
+# is derived from any real evaluated document.
+
+
+def _pdf_page_texts(pdf_bytes: bytes) -> list[str]:
+    """Text layer of each page of a generated PDF, via pdfplumber."""
+    import pdfplumber
+
+    with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
+        return [(page.extract_text() or "") for page in pdf.pages]
+
+
+_DEJAVU = next(
+    (p for p in ["/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"] if Path(p).exists()),
+    None,
+)
+
+
+def _png_lines_dejavu(lines: list[str]) -> bytes:
+    """Several lines of large, crisp black-on-white text in a real scalable
+    font (DejaVu) - OCRs reliably, unlike Pillow's tiny bitmap default."""
+    font = ImageFont.truetype(_DEJAVU, 40)
+    w, line_h = 1400, 66
+    img = Image.new("RGB", (w, line_h * len(lines) + 40), "white")
+    d = ImageDraw.Draw(img)
+    for i, ln in enumerate(lines):
+        d.text((40, 20 + i * line_h), ln, fill="black", font=font)
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    return buf.getvalue()
+
+
+def _two_page_scanned_pdf(marker_a: str, marker_b: str) -> bytes:
+    """A 2-page PDF, each page nothing but an embedded raster of one marker
+    word - i.e. a scanned document with no text layer."""
+    from reportlab.lib.utils import ImageReader
+    from reportlab.pdfgen import canvas
+
+    buf = io.BytesIO()
+    c = canvas.Canvas(buf)
+    for marker in (marker_a, marker_b):
+        c.drawImage(
+            ImageReader(io.BytesIO(_png_with_text(marker))), 72, 650, width=400, height=80
+        )
+        c.showPage()
+    c.save()
+    return buf.getvalue()
+
+
+async def test_searchable_pdf_rejects_empty_file(client):
+    resp = await client.post(
+        "/searchable-pdf", files={"file": ("scan.png", b"", "image/png")}
+    )
+    assert resp.status_code == 400
+
+
+async def test_searchable_pdf_rejects_malformed_lang(client):
+    """`lang` shape is regex-validated before any Tesseract work."""
+    png_bytes = _png_with_text("HELLO")
+    resp = await client.post(
+        "/searchable-pdf",
+        params={"lang": "english"},
+        files={"file": ("scan.png", png_bytes, "image/png")},
+    )
+    assert resp.status_code == 422
+
+
+@pytest.mark.skipif(not _TESSERACT_AVAILABLE, reason="tesseract binary not installed")
+async def test_searchable_pdf_from_scanned_image_is_searchable(client):
+    """A scanned image -> application/pdf whose invisible text layer is
+    extractable and carries the page's words."""
+    png_bytes = _png_with_text("SENTINELWORD")
+    resp = await client.post(
+        "/searchable-pdf", files={"file": ("scan.png", png_bytes, "image/png")}
+    )
+    assert resp.status_code == 200
+    assert resp.headers["content-type"] == "application/pdf"
+    assert resp.content[:4] == b"%PDF"
+
+    pages = _pdf_page_texts(resp.content)
+    assert len(pages) == 1
+    assert "SENTINEL" in pages[0].upper(), f"text layer missing marker: {pages[0]!r}"
+
+
+@pytest.mark.skipif(not _TESSERACT_AVAILABLE, reason="tesseract binary not installed")
+async def test_searchable_pdf_multipage_preserves_page_order(client):
+    pdf_in = _two_page_scanned_pdf("SENTINELALPHA", "SENTINELBRAVO")
+    resp = await client.post(
+        "/searchable-pdf", files={"file": ("scan.pdf", pdf_in, "application/pdf")}
+    )
+    assert resp.status_code == 200
+    pages = _pdf_page_texts(resp.content)
+    assert len(pages) == 2
+    assert "SENTINELALPHA" in pages[0].upper().replace(" ", "")
+    assert "SENTINELBRAVO" in pages[1].upper().replace(" ", "")
+
+
+@pytest.mark.skipif(
+    not (_TESSERACT_AVAILABLE and _DEJAVU), reason="tesseract or DejaVu font missing"
+)
+async def test_searchable_pdf_pinned_psm6_keeps_label_value_rows_on_one_line(client):
+    """Regression for the A/B eval finding: with the pinned `--psm 6` pass,
+    each 'LABEL ... VALUE' row stays on ONE text line in the invisible layer
+    (psm 3 fragmented such wide rows into disjoint column blocks)."""
+    rows = [
+        "ALPHAFIELD                              AVALUE",
+        "BRAVOFIELD                              BVALUE",
+        "CHARLIEFIELD                            CVALUE",
+    ]
+    resp = await client.post(
+        "/searchable-pdf",
+        files={"file": ("grid.png", _png_lines_dejavu(rows), "image/png")},
+    )
+    assert resp.status_code == 200
+    out_lines = [ln.upper() for ln in _pdf_page_texts(resp.content)[0].splitlines()]
+    alpha = next((ln for ln in out_lines if "ALPHAFIELD" in ln), None)
+    assert alpha is not None, f"row label not recognised at all: {out_lines!r}"
+    assert "AVALUE" in alpha, f"psm-6 row split across lines: {alpha!r}"
+
+
+@pytest.mark.skipif(
+    not (_TESSERACT_AVAILABLE and "guj" in _INSTALLED_LANGS and _GUJ_FONT),
+    reason="tesseract, guj tessdata, or a Gujarati font missing",
+)
+async def test_searchable_pdf_gujarati_invisible_layer_is_unicode(client):
+    """`lang=eng+guj`: the generated PDF's invisible text layer must be real
+    Gujarati Unicode (selectable/searchable), not mojibake. Fabricated
+    generic phrase - a common greeting, not from any document."""
+    png_bytes = _png_with_script_lines(["નમસ્તે આરોગ્ય કેન્દ્ર", "તપાસ અહેવાલ"], _GUJ_FONT)
+    resp = await client.post(
+        "/searchable-pdf",
+        params={"lang": "eng+guj"},
+        files={"file": ("scan.png", png_bytes, "image/png")},
+    )
+    assert resp.status_code == 200
+    joined = "".join(_pdf_page_texts(resp.content))
+    assert _count_in_range(joined, _GUJ_RANGE) >= 5, f"no Gujarati in text layer: {joined!r}"
+    assert _count_in_range(joined, _DEVA_RANGE) == 0
+
+
+@pytest.mark.skipif(
+    not (_TESSERACT_AVAILABLE and "nep" in _INSTALLED_LANGS and _DEVA_FONT),
+    reason="tesseract, nep tessdata, or a Devanagari font missing",
+)
+async def test_searchable_pdf_devanagari_invisible_layer_is_unicode(client):
+    """`lang=eng+nep`: invisible text layer must be real Devanagari Unicode.
+    Fabricated generic greeting phrase."""
+    png_bytes = _png_with_script_lines(["नमस्ते स्वास्थ्य केन्द्र", "जाँच प्रतिवेदन"], _DEVA_FONT)
+    resp = await client.post(
+        "/searchable-pdf",
+        params={"lang": "eng+nep"},
+        files={"file": ("scan.png", png_bytes, "image/png")},
+    )
+    assert resp.status_code == 200
+    assert _count_in_range("".join(_pdf_page_texts(resp.content)), _DEVA_RANGE) >= 5
