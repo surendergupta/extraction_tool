@@ -1,4 +1,4 @@
 -r requirements.txt
 pytest==8.3.4
 pytest-asyncio==0.25.0
-pillow==11.0.0
+# pillow is now a runtime dep (see requirements.txt) - used here by tests too

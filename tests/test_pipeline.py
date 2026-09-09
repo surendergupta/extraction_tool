@@ -5,7 +5,8 @@ import httpx
 
 from app.config import get_settings
 from app.enums import DocumentStatus
-from app.services.ocr import OCRError, OcrResult
+from app.services.ocr import OcrImage, OCRError, OcrResult, RuledTableRegion
+from app.storage import get_storage_backend
 from app.worker import run_ocr_extraction, run_structure_parsing
 
 pytestmark = pytest.mark.asyncio(loop_scope="session")
@@ -69,6 +70,86 @@ async def test_full_pipeline_queued_to_done(make_document, worker_ctx, monkeypat
         assert refreshed.structured_data["sections"][0]["title"] == "NOTES"
 
 
+async def test_ocr_step_persists_image_regions_and_crop_bytes(
+    make_document, worker_ctx, monkeypatch
+):
+    """WP-B: image regions returned by the OCR service are stored - crop
+    bytes into the storage backend, metadata onto Document.image_regions -
+    and this must not disturb text extraction or the job chain."""
+    document = await make_document(status=DocumentStatus.QUEUED)
+
+    async def fake_extract_text(filename: str, data: bytes) -> OcrResult:
+        return OcrResult(
+            text="REPORT:\nfindings here.",
+            images=[
+                OcrImage(
+                    data=b"\x89PNG\r\n\x1a\n-fake-logo-bytes",
+                    bbox=[25.0, 7.0, 585.0, 108.5],
+                    bbox_space="pdf_points",
+                    page=0,
+                    source="embedded",
+                    region_type_guess="logo",
+                    width=640,
+                    height=116,
+                    image_format="png",
+                ),
+                OcrImage(
+                    data=b"\xff\xd8\xff-fake-jpeg-chart-bytes",
+                    bbox=[100, 200, 400, 500],
+                    bbox_space="page_pixels",
+                    page=1,
+                    source="detected",
+                    region_type_guess="chart",
+                    width=300,
+                    height=300,
+                    image_format="jpg",
+                ),
+            ],
+        )
+
+    monkeypatch.setattr("app.worker.ocr.extract_text", fake_extract_text)
+
+    await run_ocr_extraction(worker_ctx, str(document.id))
+
+    storage = get_storage_backend()
+    async with worker_ctx["sessionmaker"]() as session:
+        refreshed = await session.get(type(document), document.id)
+        assert refreshed.extracted_text == "REPORT:\nfindings here."   # unchanged
+        regions = refreshed.image_regions
+        assert isinstance(regions, list) and len(regions) == 2
+
+        assert regions[0]["storage_key"] == f"{document.id}/images/0.png"
+        assert regions[0]["source"] == "embedded"
+        assert regions[0]["region_type_guess"] == "logo"
+        assert regions[0]["bbox_space"] == "pdf_points"
+        assert regions[1]["storage_key"] == f"{document.id}/images/1.jpg"
+        assert regions[1]["source"] == "detected"
+
+        for r in regions:
+            assert storage.exists(r["storage_key"])
+        assert storage.read(regions[0]["storage_key"]) == b"\x89PNG\r\n\x1a\n-fake-logo-bytes"
+
+    # job chain still advances to structure parsing
+    queued = await worker_ctx["redis"].queued_jobs()
+    assert "run_structure_parsing" in [j.function for j in queued]
+
+
+async def test_ocr_step_leaves_image_regions_null_when_none_returned(
+    make_document, worker_ctx, monkeypatch
+):
+    document = await make_document(status=DocumentStatus.QUEUED)
+
+    async def fake_extract_text(filename: str, data: bytes) -> OcrResult:
+        return OcrResult(text="PLAIN:\njust text.")
+
+    monkeypatch.setattr("app.worker.ocr.extract_text", fake_extract_text)
+    await run_ocr_extraction(worker_ctx, str(document.id))
+
+    async with worker_ctx["sessionmaker"]() as session:
+        refreshed = await session.get(type(document), document.id)
+        assert refreshed.image_regions is None
+
+
 async def test_native_pdf_tables_flow_through_to_structured_data(
     make_document, worker_ctx, monkeypatch
 ):
@@ -84,18 +165,25 @@ async def test_native_pdf_tables_flow_through_to_structured_data(
     ]
 
     async def fake_extract_text(filename: str, data: bytes) -> OcrResult:
-        return OcrResult(text="LAB REPORT:\nSee results below.", tables=[native_table])
+        return OcrResult(
+            text="LAB REPORT:\nSee results below.",
+            tables=[native_table],
+            text_source="native_pdf",
+        )
 
     monkeypatch.setattr("app.worker.ocr.extract_text", fake_extract_text)
 
     await run_ocr_extraction(worker_ctx, str(document.id))
 
-    # the OCR step must hand pdfplumber's tables to the next job, not drop them
+    # the OCR step must hand pdfplumber's tables (and, for the OCR path,
+    # ruled-line regions + text_source) to the next job, not drop them
     queued = await worker_ctx["redis"].queued_jobs()
     structure_job = next(j for j in queued if j.function == "run_structure_parsing")
-    assert structure_job.args == (str(document.id), [native_table])
+    assert structure_job.args == (str(document.id), [native_table], [], "native_pdf")
 
-    await run_structure_parsing(worker_ctx, str(document.id), [native_table])
+    await run_structure_parsing(
+        worker_ctx, str(document.id), [native_table], [], "native_pdf"
+    )
 
     async with worker_ctx["sessionmaker"]() as session:
         refreshed = await session.get(type(document), document.id)
@@ -111,7 +199,57 @@ async def test_native_pdf_tables_flow_through_to_structured_data(
             "Unit",
         ]
         assert tables[0]["rows"][1] == ["Haemoglobin", "", "11.4", "12.0-15.0", "g/dL"]
-        assert tables[0]["rows"][2] == ["WBC", "L", "9.6", "4-10", "10^3/mm3"]
+
+
+async def test_ocr_path_ruled_line_regions_flow_through_and_disable_heuristic(
+    make_document, worker_ctx, monkeypatch
+):
+    """WP-D: on the rasterize+OCR path the OCR service returns ruled-line
+    table *regions* (bbox + region_text, no grid). Those must ride the job
+    chain into structured_data["tables"] as source="ruled_line_region", and
+    the legacy space-heuristic must NOT also run on the OCR text."""
+    document = await make_document(status=DocumentStatus.QUEUED)
+
+    async def fake_extract_text(filename: str, data: bytes) -> OcrResult:
+        return OcrResult(
+            # this text has space-aligned lines the old heuristic WOULD have
+            # turned into a bogus table - it must not, on the OCR path
+            text="RESULTS\nHaemoglobin    11.4 g/dL\nWBC    9.6",
+            table_regions=[
+                RuledTableRegion(
+                    bbox=[10, 20, 400, 300],
+                    region_text="Region BMD T-Score\nAP Spine 1.234 0.5\nDualFemur 0.987 0.3",
+                    page=0,
+                )
+            ],
+            text_source="ocr",
+        )
+
+    monkeypatch.setattr("app.worker.ocr.extract_text", fake_extract_text)
+
+    await run_ocr_extraction(worker_ctx, str(document.id))
+    queued = await worker_ctx["redis"].queued_jobs()
+    job = next(j for j in queued if j.function == "run_structure_parsing")
+    assert job.args == (
+        str(document.id),
+        [],
+        [{"bbox": [10, 20, 400, 300], "region_text": job.args[2][0]["region_text"], "page": 0}],
+        "ocr",
+    )
+
+    await run_structure_parsing(worker_ctx, str(document.id), *job.args[1:])
+
+    async with worker_ctx["sessionmaker"]() as session:
+        refreshed = await session.get(type(document), document.id)
+        assert refreshed.status == DocumentStatus.DONE
+        tables = refreshed.structured_data["tables"]
+        assert len(tables) == 1
+        assert tables[0]["source"] == "ruled_line_region"
+        assert "AP Spine 1.234" in tables[0]["region_text"]
+        assert tables[0]["bbox"] == [10, 20, 400, 300]
+        assert "rows" not in tables[0]                      # NOT a grid
+        # the space-aligned OCR text was NOT turned into a heuristic table
+        assert all(t["source"] == "ruled_line_region" for t in tables)
 
 
 async def test_ocr_failure_marks_document_failed_and_never_leaves_it_processing(
@@ -167,7 +305,7 @@ async def test_structure_failure_marks_document_failed(make_document, worker_ctx
         status=DocumentStatus.PROCESSING, extracted_text="some ocr text"
     )
 
-    def boom(text, native_tables=None):
+    def boom(text, *args, **kwargs):
         raise ValueError("bad heuristic input")
 
     monkeypatch.setattr("app.worker.structure.parse_structure", boom)

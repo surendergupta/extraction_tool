@@ -1,15 +1,87 @@
 import io
 import shutil
+import subprocess
+from pathlib import Path
 
 import pytest
 from httpx import ASGITransport, AsyncClient
-from PIL import Image, ImageDraw
+from PIL import Image, ImageDraw, ImageFont
 
 from app.main import app
 
 pytestmark = pytest.mark.asyncio
 
 _TESSERACT_AVAILABLE = shutil.which("tesseract") is not None
+
+
+def _installed_langs() -> set[str]:
+    if not _TESSERACT_AVAILABLE:
+        return set()
+    try:
+        out = subprocess.run(
+            ["tesseract", "--list-langs"], capture_output=True, text=True, timeout=30
+        )
+    except (OSError, subprocess.SubprocessError):
+        return set()
+    # `tesseract --list-langs` prints a header line then one code per line,
+    # historically to stderr - merge both streams and drop the header.
+    lines = (out.stdout + out.stderr).splitlines()
+    return {ln.strip() for ln in lines if ln.strip() and "List of available" not in ln}
+
+
+_INSTALLED_LANGS = _installed_langs()
+
+# Lohit fonts are installed by the ocr_service Docker image purely so these
+# tests (and the eval harness) can render real Gujarati/Devanagari glyphs
+# into synthetic sample images. Outside that image they're usually absent,
+# and the script-OCR tests below skip.
+_GUJ_FONT = next(
+    (
+        p
+        for p in [
+            "/usr/share/fonts/truetype/lohit-gujarati/Lohit-Gujarati.ttf",
+            "/usr/share/fonts/truetype/fonts-gujr-extra/Lohit-Gujarati.ttf",
+        ]
+        if Path(p).exists()
+    ),
+    None,
+)
+_DEVA_FONT = next(
+    (
+        p
+        for p in [
+            "/usr/share/fonts/truetype/lohit-devanagari/Lohit-Devanagari.ttf",
+            "/usr/share/fonts/truetype/lohit-nepali/Lohit-Nepali.ttf",
+        ]
+        if Path(p).exists()
+    ),
+    None,
+)
+
+_GUJ_RANGE = range(0x0A80, 0x0B00)  # Gujarati Unicode block
+_DEVA_RANGE = range(0x0900, 0x0980)  # Devanagari Unicode block
+
+
+def _count_in_range(text: str, code_range: range) -> int:
+    return sum(1 for ch in text if ord(ch) in code_range)
+
+
+def _png_with_script_lines(lines: list[str], font_path: str) -> bytes:
+    """Render `lines` as large, high-contrast black-on-white text using a
+    script-capable TrueType font - a deliberately clean, synthetic stand-in
+    for a photographed multi-script document (real photos OCR far worse; the
+    tests only assert the script is recognised *at all*, not accuracy)."""
+    font = ImageFont.truetype(font_path, 44)
+    width = 1000
+    line_h = 70
+    img = Image.new("RGB", (width, line_h * len(lines) + 40), color="white")
+    draw = ImageDraw.Draw(img)
+    for i, line in enumerate(lines):
+        draw.text((30, 20 + i * line_h), line, fill="black", font=font)
+    scaled = img.resize((width * 2, img.height * 2), Image.LANCZOS)
+    buf = io.BytesIO()
+    scaled.save(buf, format="PNG")
+    return buf.getvalue()
 
 
 @pytest.fixture
@@ -148,6 +220,290 @@ def _scanned_pdf_from_png(png_bytes: bytes) -> bytes:
     return buf.getvalue()
 
 
+# --- WP-B: image/photo/chart region extraction -----------------------------
+
+import base64  # noqa: E402
+
+
+def _photo_like_png(w: int, h: int) -> bytes:
+    """A smooth 2-D colour gradient - a continuous-tone stand-in for a photo
+    or chart region (no text, high fill, high local variance)."""
+    import numpy as np
+
+    ys = np.linspace(0, 255, h, dtype=np.float32)[:, None]
+    xs = np.linspace(0, 255, w, dtype=np.float32)[None, :]
+    r = np.tile(xs, (h, 1))
+    g = np.tile(ys, (1, w))
+    b = (255 - 0.5 * (r + g)).clip(0, 255)
+    arr = np.dstack([r, g, b]).astype("uint8")
+    buf = io.BytesIO()
+    Image.fromarray(arr).save(buf, format="PNG")
+    return buf.getvalue()
+
+
+def _page_png_with_text_and_photo() -> bytes:
+    """A synthetic 'scanned page': white background, several lines of real
+    text, and a pasted photo-like block in the lower area."""
+    page = Image.new("RGB", (1000, 1300), "white")
+    d = ImageDraw.Draw(page)
+    for i in range(14):
+        d.text((60, 60 + i * 34), f"PATIENT RECORD LINE NUMBER {i} - HELLO WORLD", fill="black")
+    photo = Image.open(io.BytesIO(_photo_like_png(520, 460)))
+    page.paste(photo, (240, 720))
+    buf = io.BytesIO()
+    page.save(buf, format="PNG")
+    return buf.getvalue()
+
+
+def _text_only_page_png() -> bytes:
+    """Negative control: a page that is nothing but text."""
+    page = Image.new("RGB", (1000, 1300), "white")
+    d = ImageDraw.Draw(page)
+    for i in range(30):
+        d.text((60, 50 + i * 38), f"LINE {i:02d} THE QUICK BROWN FOX JUMPS OVER THE LAZY DOG 123", fill="black")
+    buf = io.BytesIO()
+    page.save(buf, format="PNG")
+    return buf.getvalue()
+
+
+def _native_pdf_with_text_and_embedded_image() -> bytes:
+    """A PDF with a real text layer AND an embedded raster image - mirrors a
+    lab report whose letterhead logo is a raster on an otherwise-typed page."""
+    from reportlab.lib.utils import ImageReader
+    from reportlab.pdfgen import canvas
+
+    buf = io.BytesIO()
+    c = canvas.Canvas(buf)
+    c.drawImage(ImageReader(io.BytesIO(_photo_like_png(300, 120))), 60, 700, width=300, height=120)
+    t = c.beginText(60, 660)
+    for line in [
+        "SREE DIAGNOSTIC CENTRE - HAEMATOLOGY REPORT",
+        "Patient Name: John Matthew    Age/Sex: 47 / Male",
+        "Haemoglobin 11.4 g/dL    Total Leucocyte Count 9600 /cu.mm",
+        "Impression: Mild anaemia. Clinical correlation advised.",
+    ]:
+        t.textLine(line)
+    c.drawText(t)
+    c.save()
+    return buf.getvalue()
+
+
+def _decodes_to_image(b64: str) -> tuple[int, int]:
+    im = Image.open(io.BytesIO(base64.b64decode(b64)))
+    im.load()
+    return im.size
+
+
+# --- WP-D: ruled-line table region detection (OCR-fallback path) ------------
+
+
+def _font(size: int):
+    try:
+        return ImageFont.load_default(size=size)      # Pillow >= 10: scalable default
+    except TypeError:                                   # very old Pillow
+        return ImageFont.load_default()
+
+
+def _png_ruled_table(rows: list[list[str]], cell_w: int = 300, cell_h: int = 60) -> bytes:
+    """A synthetic scanned page: a heading line, then a fully ruled grid
+    table (drawn lines + text). Mirrors what the ruled-line detector is for."""
+    ncols = max(len(r) for r in rows)
+    w = 100 + ncols * cell_w
+    h = 260 + len(rows) * cell_h
+    img = Image.new("RGB", (w, h), "white")
+    d = ImageDraw.Draw(img)
+    d.text((40, 36), "MEDICAL EXAMINATION REPORT", fill="black", font=_font(26))
+    body = _font(24)
+    x0, y0 = 50, 160
+    for i in range(len(rows) + 1):
+        d.line((x0, y0 + i * cell_h, x0 + ncols * cell_w, y0 + i * cell_h), fill="black", width=2)
+    for j in range(ncols + 1):
+        d.line((x0 + j * cell_w, y0, x0 + j * cell_w, y0 + len(rows) * cell_h), fill="black", width=2)
+    for i, row in enumerate(rows):
+        for j, cell in enumerate(row):
+            d.text((x0 + j * cell_w + 12, y0 + i * cell_h + 16), cell, fill="black", font=body)
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    return buf.getvalue()
+
+
+def _png_colored_chart_box() -> bytes:
+    """A bordered box filled with saturated green/yellow/red bands - the
+    DEXA reference-chart false-positive pattern the FP filter must reject."""
+    import numpy as np
+
+    w, h = 900, 380
+    arr = np.full((h, w, 3), 255, np.uint8)
+    bands = [(60, 200, 60), (240, 230, 40), (220, 40, 40)]
+    for k, col in enumerate(bands):
+        arr[40 + k * 110:40 + (k + 1) * 110, 40:w - 40] = col
+    img = Image.fromarray(arr)
+    d = ImageDraw.Draw(img)
+    d.rectangle((30, 30, w - 30, h - 30), outline="black", width=3)
+    for gx in range(120, w - 40, 120):
+        d.line((gx, 40, gx, h - 40), fill="black", width=1)
+    d.text((45, 5), "Reference: AP Spine L1-L4", fill="black")
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    return buf.getvalue()
+
+
+def _png_form_field_grid() -> bytes:
+    """A small, wide grid of many boxed label:value fields - the Gulf
+    CANDIDATE INFORMATION false-positive pattern the FP filter must reject.
+    ~5 rows x 6 cols of short label/value cells."""
+    labels = [
+        ["Name", "JOHN", "Age", "36", "Marital", "MARRIED"],
+        ["Son of", "ROBERT", "Gender", "MALE", "Nationality", "INDIAN"],
+        ["Place", "CITY", "Weight", "72", "Passport", "A0000000"],
+        ["Post", "TECH", "Height", "167", "Visa Date", "-"],
+        ["Issue", "2023", "Expiry", "2025", "Visa No", "-"],
+    ]
+    return _png_ruled_table(labels, cell_w=200, cell_h=54)
+
+
+async def test_ocr_native_pdf_has_no_table_regions(client):
+    """Native-PDF path: `table_regions` is always empty and text_source
+    says so. The ruled-line detector is OCR-fallback-path only."""
+    pdf_bytes = _pdf_with_table()
+    resp = await client.post("/ocr", files={"file": ("r.pdf", pdf_bytes, "application/pdf")})
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["text_source"] == "native_pdf"
+    assert body["table_regions"] == []
+    assert len(body["tables"]) == 1                     # native grid unchanged
+
+
+@pytest.mark.skipif(not _TESSERACT_AVAILABLE, reason="tesseract binary not installed")
+async def test_ocr_scanned_ruled_table_returns_region(client):
+    """A scanned page with a ruled table -> one `ruled_line_region` entry:
+    a bbox + a whole-region OCR text blob, NO grid. `tables` stays empty
+    (that's the native-PDF field)."""
+    png = _png_ruled_table([
+        ["Type of Examination", "Result"],
+        ["Haemoglobin", "11.4 g/dL"],
+        ["Blood Pressure", "120/80"],
+        ["Total Leucocyte Count", "9600"],
+        ["Platelet Count", "2.15 lakh"],
+    ])
+    resp = await client.post("/ocr", files={"file": ("scan.png", png, "image/png")})
+    assert resp.status_code == 200
+    body = resp.json()
+
+    assert body["text_source"] == "ocr"
+    assert body["tables"] == []                          # native-grid field, unused here
+    assert len(body["table_regions"]) >= 1
+    tr = body["table_regions"][0]
+    assert tr["source"] == "ruled_line_region"
+    assert "region_text" in tr and "rows" not in tr      # a blob, not a grid
+    x0, y0, x1, y1 = tr["bbox"]
+    assert 0 <= x0 < x1 and 0 <= y0 < y1
+    blob = tr["region_text"].lower()
+    assert "haemoglobin" in blob and ("120/80" in blob or "9600" in blob)
+
+
+@pytest.mark.skipif(not _TESSERACT_AVAILABLE, reason="tesseract binary not installed")
+async def test_ocr_ruled_line_fp_filter_suppresses_colored_chart(client):
+    """FP filter (WP-D): a bordered, strongly-coloured multi-hue box (a
+    reference-chart pattern) must NOT be returned as a table region."""
+    png = _png_colored_chart_box()
+    resp = await client.post("/ocr", files={"file": ("chart.png", png, "image/png")})
+    assert resp.status_code == 200
+    assert resp.json()["table_regions"] == []
+
+
+@pytest.mark.skipif(not _TESSERACT_AVAILABLE, reason="tesseract binary not installed")
+async def test_ocr_ruled_line_fp_filter_suppresses_form_field_grid(client):
+    """FP filter (WP-D): a small, wide grid of many boxed label:value fields
+    (the CANDIDATE INFORMATION pattern) must NOT be returned as a table."""
+    png = _png_form_field_grid()
+    resp = await client.post("/ocr", files={"file": ("form.png", png, "image/png")})
+    assert resp.status_code == 200
+    assert resp.json()["table_regions"] == []
+
+
+@pytest.mark.skipif(not _TESSERACT_AVAILABLE, reason="tesseract binary not installed")
+async def test_ocr_text_only_page_no_table_regions(client):
+    """Negative control: a text-only page yields no ruled-line table
+    regions (no rules to detect)."""
+    resp = await client.post(
+        "/ocr", files={"file": ("t.png", _text_only_page_png(), "image/png")}
+    )
+    assert resp.status_code == 200
+    assert resp.json()["table_regions"] == []
+
+
+async def test_ocr_native_pdf_returns_embedded_images(client):
+    """The native-PDF path must return each embedded raster image with a
+    PDF-points bbox and real, decodable bytes - not empty/corrupt data."""
+    pdf_bytes = _native_pdf_with_text_and_embedded_image()
+    resp = await client.post("/ocr", files={"file": ("report.pdf", pdf_bytes, "application/pdf")})
+    assert resp.status_code == 200
+    body = resp.json()
+
+    assert "HAEMATOLOGY REPORT" in body["text"]        # text extraction unaffected
+    assert len(body["images"]) >= 1
+    img = body["images"][0]
+    assert img["source"] == "embedded"
+    assert img["bbox_space"] == "pdf_points"
+    assert img["region_type_guess"] in {"photo", "chart", "logo", "stamp", "unknown"}
+    w, h = _decodes_to_image(img["image_base64"])
+    assert w > 0 and h > 0
+    x0, y0, x1, y1 = img["bbox"]
+    assert 0 <= x0 < x1 and 0 <= y0 < y1                # sane box
+
+
+async def test_ocr_extract_images_false_disables_image_output(client):
+    pdf_bytes = _native_pdf_with_text_and_embedded_image()
+    resp = await client.post(
+        "/ocr",
+        params={"extract_images": "false"},
+        files={"file": ("report.pdf", pdf_bytes, "application/pdf")},
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["images"] == []
+    assert "HAEMATOLOGY REPORT" in body["text"]         # still extracted
+
+
+@pytest.mark.skipif(not _TESSERACT_AVAILABLE, reason="tesseract binary not installed")
+async def test_ocr_scanned_page_detects_photo_region(client):
+    """A rasterised page with a photo-like block among text: the block is
+    detected and returned as a 'detected' image region; text still extracted."""
+    png = _page_png_with_text_and_photo()
+    resp = await client.post("/ocr", files={"file": ("scan.png", png, "image/png")})
+    assert resp.status_code == 200
+    body = resp.json()
+
+    assert "HELLO" in body["text"].upper()             # text extraction unaffected
+    detected = [i for i in body["images"] if i["source"] == "detected"]
+    assert detected, "expected at least one detected image region"
+
+    # at least one region overlaps where the block was pasted (x 240..760, y 720..1180)
+    def _overlaps(b):
+        x0, y0, x1, y1 = b
+        return x1 > 200 and x0 < 800 and y1 > 680 and y0 < 1220
+
+    assert any(_overlaps(i["bbox"]) for i in detected)
+    for i in detected:
+        assert i["bbox_space"] == "page_pixels"
+        w, h = _decodes_to_image(i["image_base64"])
+        assert w > 0 and h > 0
+
+
+@pytest.mark.skipif(not _TESSERACT_AVAILABLE, reason="tesseract binary not installed")
+async def test_ocr_text_only_page_detects_no_image_regions(client):
+    """Negative control: a text-only page must not yield any detected image
+    region (a text block wrongly returned as an image would be lost to any
+    downstream text consumer)."""
+    png = _text_only_page_png()
+    resp = await client.post("/ocr", files={"file": ("text.png", png, "image/png")})
+    assert resp.status_code == 200
+    body = resp.json()
+    assert "QUICK BROWN FOX" in body["text"].upper()
+    assert [i for i in body["images"] if i["source"] == "detected"] == []
+
+
 async def test_health(client):
     response = await client.get("/health")
     assert response.status_code == 200
@@ -169,6 +525,8 @@ async def test_ocr_native_pdf_skips_rasterization(client):
     assert "Native PDF text extraction works." in body["text"]
     # no table on this document - must not report a false positive
     assert body["tables"] == []
+    assert body["table_regions"] == []
+    assert body["text_source"] == "native_pdf"
 
 
 async def test_ocr_native_pdf_with_table_returns_tables(client):
@@ -236,6 +594,8 @@ async def test_ocr_image_extracts_text(client):
     assert "HELLO" in body["text"].upper()
     # images never have a pdfplumber page object to extract_tables() from
     assert body["tables"] == []
+    assert body["text_source"] == "ocr"
+    assert body["table_regions"] == []                  # plain text, no ruled table
 
 
 @pytest.mark.skipif(not _TESSERACT_AVAILABLE, reason="tesseract binary not installed")
@@ -253,3 +613,106 @@ async def test_ocr_scanned_pdf_falls_back_to_tesseract(client):
     assert "SCANNED" in body["text"].upper()
     # rasterized/OCR path has no pdfplumber page object - must never report tables
     assert body["tables"] == []
+
+
+# --- lang param (multi-script OCR) -------------------------------------------
+
+
+async def test_ocr_rejects_malformed_lang_param(client):
+    """The `lang` value goes onto the Tesseract command line, so its shape is
+    constrained to 3-letter codes joined by '+'. Anything else is a 422 from
+    request validation, before any OCR runs (no tesseract needed)."""
+    png_bytes = _png_with_text("HELLO")
+    for bad in ("english", "eng;ls", "eng+", "e", "eng ", "../eng"):
+        response = await client.post(
+            "/ocr",
+            params={"lang": bad},
+            files={"file": ("scan.png", png_bytes, "image/png")},
+        )
+        assert response.status_code == 422, f"{bad!r} should be rejected"
+
+
+async def test_ocr_rejects_uninstalled_lang_pack(client):
+    """A `lang` that passes the shape check but names a pack not baked into
+    the image is a clean 400 - NOT a silent downgrade. Tesseract given
+    `eng+zzz` with no zzz.traineddata just drops zzz and runs as `eng`
+    (verified); the endpoint refuses that ambiguity explicitly."""
+    png_bytes = _png_with_text("HELLO")
+    response = await client.post(
+        "/ocr", params={"lang": "eng+zzz"}, files={"file": ("scan.png", png_bytes, "image/png")}
+    )
+    assert response.status_code == 400
+    assert "zzz" in response.json()["detail"]
+
+
+@pytest.mark.skipif(not _TESSERACT_AVAILABLE, reason="tesseract binary not installed")
+async def test_ocr_lang_omitted_is_unchanged_english_behaviour(client):
+    """Omitting `lang` must behave exactly like the pre-existing English-only
+    path: same request shape, English text still recognised."""
+    png_bytes = _png_with_text("HELLO WORLD")
+    response = await client.post("/ocr", files={"file": ("scan.png", png_bytes, "image/png")})
+    assert response.status_code == 200
+    assert "HELLO" in response.json()["text"].upper()
+
+
+@pytest.mark.skipif(not _TESSERACT_AVAILABLE, reason="tesseract binary not installed")
+async def test_ocr_explicit_eng_matches_default(client):
+    """`lang=eng` explicitly must produce the same output as omitting it."""
+    png_bytes = _png_with_text("HELLO WORLD")
+    default = await client.post("/ocr", files={"file": ("s.png", png_bytes, "image/png")})
+    explicit = await client.post(
+        "/ocr", params={"lang": "eng"}, files={"file": ("s.png", png_bytes, "image/png")}
+    )
+    assert default.status_code == explicit.status_code == 200
+    assert default.json()["text"] == explicit.json()["text"]
+
+
+@pytest.mark.skipif(
+    not (_TESSERACT_AVAILABLE and "guj" in _INSTALLED_LANGS and _GUJ_FONT),
+    reason="tesseract, guj tessdata, or a Gujarati font missing",
+)
+async def test_ocr_eng_guj_recognises_gujarati_script(client):
+    """Realistic-synthetic: a Gujarati hospital letterhead with an English
+    body line (mirroring the described real sample), OCR'd in combined
+    `eng+guj` mode. Assert only that the Gujarati script is recognised at
+    all - non-empty, enough characters land in the Gujarati Unicode block,
+    and no Devanagari leaks in. Not exact accuracy, and not the English
+    line (Lohit-Gujarati's Latin glyphs OCR poorly - a font artefact of the
+    synthetic render, not the combined mode; see ocr_service/README.md)."""
+    png_bytes = _png_with_script_lines(
+        ["સિવિલ હોસ્પિટલ અમદાવાદ", "દર્દીનું નામ અને ઉંમર", "Blood Report - Haemoglobin"],
+        _GUJ_FONT,
+    )
+    response = await client.post(
+        "/ocr", params={"lang": "eng+guj"}, files={"file": ("letterhead.png", png_bytes, "image/png")}
+    )
+    assert response.status_code == 200
+    text = response.json()["text"]
+    assert text.strip(), "combined-mode OCR returned nothing"
+    guj_chars = _count_in_range(text, _GUJ_RANGE)
+    assert guj_chars >= 5, f"expected Gujarati-script output, got {text!r}"
+    # Devanagari must NOT leak in from the guj model on Gujarati input.
+    assert _count_in_range(text, _DEVA_RANGE) == 0, f"unexpected Devanagari in {text!r}"
+
+
+@pytest.mark.skipif(
+    not (_TESSERACT_AVAILABLE and "nep" in _INSTALLED_LANGS and _DEVA_FONT),
+    reason="tesseract, nep tessdata, or a Devanagari font missing",
+)
+async def test_ocr_eng_nep_recognises_devanagari_script(client):
+    """Realistic-synthetic: a Nepali medical form with an English body line,
+    OCR'd in combined `eng+nep` mode. Assert only that the Devanagari script
+    is recognised at all (non-empty, enough characters in the Devanagari
+    Unicode block) - not exact accuracy."""
+    png_bytes = _png_with_script_lines(
+        ["त्रिभुवन विश्वविद्यालय अस्पताल", "बिरामीको नाम र ठेगाना", "Blood Report - Haemoglobin"],
+        _DEVA_FONT,
+    )
+    response = await client.post(
+        "/ocr", params={"lang": "eng+nep"}, files={"file": ("form.png", png_bytes, "image/png")}
+    )
+    assert response.status_code == 200
+    text = response.json()["text"]
+    assert text.strip(), "combined-mode OCR returned nothing"
+    deva_chars = _count_in_range(text, _DEVA_RANGE)
+    assert deva_chars >= 5, f"expected Devanagari-script output, got {text!r}"

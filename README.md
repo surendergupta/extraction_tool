@@ -28,7 +28,8 @@ interface — see "Storage abstraction" below), and **any OCR engine besides
 Tesseract** (no PaddleOCR fallback, no LayoutParser/Camelot, no spaCy — see
 "OCR service" below for why). Known, documented limitations (not bugs):
 image-baked text (letterheads, watermarks, any language) is invisible to
-native-PDF extraction, and the OCR fallback path is English-only — see
+native-PDF extraction, and the OCR path defaults to English (opt-in
+`lang=eng+guj` / `eng+nep` for Gujarati and Nepali/Devanagari) — see
 "Known limitations" under "OCR service" below for the real evidence behind
 both.
 
@@ -54,15 +55,16 @@ one pipeline, not four unrelated projects.
 |------------------|-----------------------------------------------------|
 | API              | FastAPI + Pydantic v2                               |
 | Queue            | Arq (Redis-backed, async-native)                    |
-| OCR              | Separate service (see below): pdfplumber native-PDF-text-first (+ table extraction), else OpenCV preprocessing + Tesseract (LSTM, English) |
+| OCR              | Separate service (see below): pdfplumber native-PDF-text-first (+ table extraction), else OpenCV preprocessing + Tesseract (LSTM; English default, opt-in `eng+guj` / `eng+nep` multi-script) |
 | Database         | PostgreSQL, SQLAlchemy 2.0 (async) + Alembic         |
 | Object storage   | Local filesystem, behind a `StorageBackend` interface |
-| Export           | `pypdf`, `python-docx`, `openpyxl`                   |
+| Export           | `pypdf`, `python-docx`, `openpyxl`, `pillow` (image embedding) |
 | Search           | Postgres full-text search (generated `tsvector` + GIN index) |
 
 ## Data model
 
-A single `documents` table (see [alembic/versions/0001_create_documents_table.py](alembic/versions/0001_create_documents_table.py)):
+A single `documents` table (migrations `0001` create, `0002` add
+`image_regions`):
 
 ```
 id                UUID PK
@@ -70,7 +72,14 @@ source            varchar        -- e.g. hospital/clinic name
 status            enum           -- QUEUED | PROCESSING | DONE | FAILED
 raw_file_path     varchar        -- storage locator (see app/storage)
 extracted_text    text, nullable
-structured_data   jsonb, nullable -- {"sections": [...], "tables": [...]}
+structured_data   jsonb, nullable -- {"sections": [...], "tables": [...]};
+                                 -- table entries have >1 shape - branch on
+                                 -- `source` (native_pdf grid | ruled_line_region
+                                 --  text blob | heuristic grid)
+image_regions     jsonb, nullable -- WP-B: [{bbox, page, source, region_type_guess,
+                                 --         storage_key, ...}]; crop bytes live in
+                                 --         storage, not the DB. Not consumed by
+                                 --         structure parsing or export yet.
 error_message     text, nullable
 search_vector     tsvector, generated from extracted_text (GIN-indexed)
 created_at        timestamptz
@@ -88,11 +97,15 @@ POST /documents/intake
 Arq worker: run_ocr_extraction
    -> status = PROCESSING
    -> read file bytes from storage, POST to the OCR service -> extracted_text
+      (+ WP-B: extracted image/photo/chart regions -> crop bytes to storage
+       under {id}/images/, metadata to Document.image_regions; not used by
+       structure parsing or export yet)
    -> enqueue "run_structure_parsing"
    -> on any failure: status = FAILED, error_message set, job stops
 
 Arq worker: run_structure_parsing
-   -> heuristically split extracted_text into sections/tables
+   -> split extracted_text into sections; tables come from the OCR service
+      (native-PDF grids, or WP-D ruled-line regions on the scanned path)
    -> Document.structured_data set, status = DONE
    -> on any failure: status = FAILED, error_message set
 ```
@@ -100,28 +113,38 @@ Arq worker: run_structure_parsing
 A document is never left stuck in `PROCESSING` — every failure path sets
 `FAILED` with a recorded `error_message` (see [app/worker.py](app/worker.py)).
 
-Structure parsing is intentionally simple (v1): a short ALL-CAPS line or a
-line ending in `:` starts a new section; consecutive lines that look
-column-aligned (pipe, tab, or 2+ spaces) become a table block.
+Section parsing is intentionally simple (v1): a short ALL-CAPS line or a
+line ending in `:` starts a new section.
 
-**Native-PDF tables are the one exception.** Native-PDF text extraction
-collapses a table's visual column spacing into single spaces (`pdfplumber`'s
-`.extract_text()`), so that space-heuristic never fires on a real table in a
-native-PDF document — confirmed on a real 4-page lab report where a results
-table (`Test Name | Status | Result | Reference Interval | Unit`) came back
-as 0 detected tables. For that path only, `ocr_service` also calls
-`page.extract_tables()` on the same pdfplumber page objects (not discarded
-once text is pulled) and hands the raw table data through the job chain
-(`run_ocr_extraction` → `run_structure_parsing`, as an extra arq job
-argument, not a DB column - it's only needed transiently between those two
-steps). When present, `parse_structure` uses it directly for that
-document's `tables` (tagged `"source": "native_pdf"` vs `"heuristic"`)
-instead of running the space-heuristic detector, skipping malformed
-(ragged/empty) tables rather than failing the document. The OCR/rasterized
-path has no page object to call `extract_tables()` on and is completely
-unaffected - it always uses the heuristic, unchanged. See
-[app/services/structure.py](app/services/structure.py) and
-[ocr_service/app/ocr.py](ocr_service/app/ocr.py).
+**Table extraction depends on the path, and `structured_data["tables"]`
+entries have more than one shape — a consumer must branch on `source`:**
+
+- **Native-PDF path** — `ocr_service` calls `page.extract_tables()` on the
+  same pdfplumber page objects used for text (needed because native-PDF
+  text collapses a table's column spacing to single spaces, so no
+  space-based detector can see it — confirmed on a real 4-page lab report
+  where a `Test Name | Status | Result | …` results table came back as 0
+  detected tables). Entries: `{raw_lines, rows: list[list[str]], source:
+  "native_pdf"}` — a real grid. Malformed (ragged/empty) tables are
+  dropped, not fatal.
+- **Rasterize+OCR path (WP-D)** — the old space-alignment heuristic was
+  measured (WP-C/WP-D) as pure garbage on scanned pages, so it is
+  **disabled** here. Instead `ocr_service`'s ruled-line detector
+  (`ocr_service/app/tables.py`) finds ruled-table bounding boxes and OCRs
+  each as one block. Entries: `{bbox, region_text: str, source:
+  "ruled_line_region"}` — **a text blob, no grid**. Borderless
+  whitespace-aligned tables are not detected (known gap); their lines stay
+  in `text` / section content.
+- The space-alignment heuristic (`source: "heuristic"`) now only runs for
+  native-PDF text that produced no `extract_tables()` grids — where its own
+  history shows it "never fires" — kept as a harmless no-op, not removed.
+
+Table data (native grids or ruled-line regions) and a `text_source` flag
+ride the job chain from `run_ocr_extraction` to `run_structure_parsing` as
+arq job arguments (transient, not DB columns). See
+[app/services/structure.py](app/services/structure.py),
+[ocr_service/app/ocr.py](ocr_service/app/ocr.py) and
+[ocr_service/app/tables.py](ocr_service/app/tables.py).
 
 **False-positive filtering.** `extract_tables()`'s default detection is
 liberal: on that same real lab report it also misdetected 2 pure-paragraph
@@ -211,26 +234,43 @@ comment above `app/services/structure.py::_is_header_line`.
 `ocr_service/` is a small standalone FastAPI app (own Dockerfile, own
 `requirements.txt`) exposing:
 
-- `POST /ocr?psm=<0-13>` — multipart `file`. For a PDF, it first tries
-  native text extraction via **pdfplumber** — if the PDF already has a real
-  text layer (i.e. it isn't just a scanned image), that text (plus any
-  tables found via `page.extract_tables()` on the same pages - see below)
-  is returned directly and Tesseract never runs. Otherwise (PDFs with no
-  text layer, and all images) it rasterizes if needed, runs OpenCV
-  preprocessing (grayscale → Otsu binarization → deskew), then Tesseract 5
-  in LSTM-only mode (`--oem 1`, English, default `--psm 6`, overridable per
-  request). Response: `{"text": str, "tables": [...]}` - `tables` is
-  pdfplumber's raw per-table row/cell shape, always `[]` outside the
-  native-PDF-text path.
+- `POST /ocr?psm=<0-13>&lang=<eng|eng+guj|eng+nep|…>&extract_images=<bool>` —
+  multipart `file`. For a PDF, it first tries native text extraction via
+  **pdfplumber** — if the PDF already has a real text layer (i.e. it isn't
+  just a scanned image), that text (plus any tables found via
+  `page.extract_tables()` on the same pages - see below) is returned
+  directly and Tesseract never runs. Otherwise (PDFs with no text layer,
+  and all images) it rasterizes if needed, runs OpenCV preprocessing
+  (grayscale → Otsu binarization → deskew), then Tesseract 5 in LSTM-only
+  mode (`--oem 1`, default `--psm 6`, overridable per request). `lang`
+  selects the Tesseract language(s): default `eng`; `eng+guj` / `eng+nep`
+  (or any `+`-joined combination of installed codes) enable **single-pass
+  multi-script OCR** for Gujarati and Nepali/Devanagari. Omitting `lang` is
+  byte-for-byte the old English-only path. Response:
+  `{"text": str, "text_source": "native_pdf"|"ocr", "tables": [...],
+  "table_regions": [...], "images": [...]}`.
+  `tables` is pdfplumber's raw per-table row/cell **grid** — native-PDF
+  path only, `[]` otherwise. `table_regions` (WP-D) is the rasterize+OCR
+  path's ruled-line table **regions** — `{bbox, region_text, source:
+  "ruled_line_region"}`, a text blob with **no grid** — `[]` on the native
+  path; borderless whitespace-aligned tables are not detected.
+  `images` (WP-B) is embedded raster images on the native path and detected
+  photo/chart/logo/stamp region crops on the rasterize+OCR path, each with
+  a bbox, a base64 crop, and a low-confidence `region_type_guess`;
+  `extract_images=false` skips it. See
+  [ocr_service/README.md](ocr_service/README.md) for the two table paths,
+  the two table shapes, and the detectors' honest measured accuracy. Text
+  extraction is unchanged regardless of the table/image options.
 - `GET /health`.
 
-This is deliberately English-only and Tesseract-only for v1 — no PaddleOCR
-fallback, no LayoutParser/Camelot table detection (pdfplumber's own
-`extract_tables()` on the native-PDF path is much lighter-weight than
-either and already shipped - see "Structure parsing" above), no spaCy
-post-processing. Those remain real options for a v2 if real documents prove
-insufficient, but they're not worth the dependency weight (and, for
-LayoutParser/detectron2, the CPU-only Docker build pain) speculatively.
+This is deliberately Tesseract-only for v1 — no PaddleOCR fallback (WP-C
+evaluated PP-Structure: Apache-2.0 but ~2.8 GB of deps+weights and it
+**crashes on this CPU stack** — not adopted), no LayoutParser/Camelot, no
+spaCy post-processing. Table structure on the scanned path is
+classical-CV only (`ocr_service/app/tables.py`, WP-D): morphological
+ruled-line detection + whole-region OCR, no new dependencies. Heavier
+engines remain a v2 option if real documents prove it insufficient, but
+aren't worth the dependency weight speculatively.
 
 **Native-PDF-text library note:** this used PyMuPDF (`fitz`) initially, but
 PyMuPDF is AGPLv3-licensed and Sense_tool has had no legal review clearing
@@ -256,22 +296,26 @@ See [ocr_service/app/ocr.py](ocr_service/app/ocr.py) and
   source-PDF authoring characteristic: the letterhead was designed as a
   graphic asset, not typed text.
 
-- **The rasterize+OCR fallback path is English-only**, separately from the
-  above: it runs Tesseract with `-l eng` only (see
-  `ocr_service/app/ocr.py::_tesseract_config`). Even a document that *did*
-  go through OCR instead of native extraction would not have its
-  Hindi/Devanagari (or any other non-English) text correctly recognized —
-  Tesseract would read it with the English model and produce garbage or
-  nothing, not real text. This is a different limitation from the one
-  above (OCR accuracy vs. images having no text at all) and would need its
-  own fix (a non-English language pack) if it mattered.
+- **The rasterize+OCR path defaults to English, with opt-in multi-script.**
+  With `lang` omitted it runs Tesseract `-l eng` only — a
+  Hindi/Devanagari, Gujarati, or any other non-English document sent
+  through OCR at that default produces Latin garbage or nothing. Passing
+  `lang=eng+guj` or `lang=eng+nep` enables Gujarati / Nepali-Devanagari
+  recognition in the same pass (tessdata for `eng`/`guj`/`nep` is baked
+  into the image; see `ocr_service/app/ocr.py::_tesseract_config` and
+  `ocr_service/Dockerfile`). It's opt-in per request, not the default —
+  see `ocr_service/README.md` ("Accuracy tradeoff") for the measured
+  reason. Other scripts still need their own language pack added. This is a
+  different limitation from the one above (OCR accuracy vs. images having
+  no text layer at all).
 
-  A workaround for the image-content case is deferred, not built: OCR the
-  image regions specifically (via `page.images` bounding boxes) with a
-  Hindi language pack. This needs image-region classification first — a
-  page's images aren't all "banner text" (that same letterhead also has
-  two unrelated portrait photos), so OCR-ing every image blindly would
-  produce garbage on the non-text ones.
+  A workaround for the *native-PDF image-content* case (script text baked
+  into a letterhead graphic, invisible to pdfplumber) is still deferred,
+  not built: OCR the image regions specifically (via `page.images`
+  bounding boxes) with the right language pack. This needs image-region
+  classification first — a page's images aren't all "banner text" (one
+  real letterhead also has two unrelated portrait photos), so OCR-ing
+  every image blindly would produce garbage on the non-text ones.
 
 ### OCR service call timeout
 
@@ -297,18 +341,61 @@ general failure handler) and sets `status=FAILED` with
 `PROCESSING`. Covered by
 `tests/test_pipeline.py::test_ocr_timeout_marks_document_failed_with_clear_message`.
 
+## Export (WP-F)
+
+`GET /documents/{id}/export?format=docx|xlsx|pdf` renders `structured_data`
+plus the WP-B extracted images. Best-effort *structured* export — not
+pixel-perfect layout ([app/services/export.py](app/services/export.py)).
+
+**Tables — two shapes, branched on `source`** (see the "Table extraction"
+note above):
+
+| `source` | DOCX | XLSX |
+|---|---|---|
+| `native_pdf` / `heuristic` (a real grid) | a real Word table, cells as extracted | real cells on the `Tables` sheet |
+| `ruled_line_region` (a text blob, no grid) | `Table N (detected, unstructured)` heading + an italic note + the `region_text` as a plain paragraph — **no fake table object** | a bold label row + the whole `region_text` in one merged, wrapped cell — **no fake column split** |
+
+**Images** — *all* `image_regions` are embedded (WP-B principle: a silently
+dropped image is worse than a low-value one; WP-B reported no "known-noise"
+guess class to exclude). `region_type_guess` is used only as a caption hint
+(`Figure N (page P, embedded|detected: photo|chart|logo|stamp|unknown)`),
+never as a filter. Ordering is by `(page, bbox top-y)` — reasonable reading
+order, not exact position.
+
+- **DOCX**: a `Figures` section, each image inline under its caption, width
+  capped to fit US-Letter margins. An image python-docx's strict header
+  parser rejects (some valid embedded-PDF JPEGs — e.g. LabReport-1.pdf's
+  signature stamp) is re-encoded via Pillow and retried before any
+  `[could not embed]` fallback.
+- **XLSX**: a dedicated `Figures` sheet (one labelled block per image) —
+  anchoring images next to their content is impractical in XLSX's grid
+  model, so a summary sheet is used deliberately, not as a fallback.
+- **PDF**: text only — image *bytes* are not embedded (PDF layout is a
+  later WP); the PDF lists the figure captions and includes the
+  `ruled_line_region` text so nothing is silently lost.
+
+`pillow` is a runtime dependency (openpyxl needs it to embed images).
+Verified end-to-end on LabReport-1.pdf (2 native grids + all 6 embedded
+images) and on the DEXA-scanned / Gulf-Gujarati `ruled_line_region`
+samples (text-blob tables render as labelled text, detected-image crops
+embed intact); a document with no tables and no images exports with no
+crash and no empty/broken elements.
+
 ## Endpoints
 
 - `POST /documents/intake` — multipart form: `source` (string), `file`
   (upload). Returns `202` with `{id, status, source}`.
-- `GET /documents/{id}` — full record, including `extracted_text` and
-  `structured_data`.
+- `GET /documents/{id}` — full record, including `extracted_text`,
+  `structured_data`, and `image_regions` (WP-B image/photo/chart region
+  metadata; crop bytes are in storage at each entry's `storage_key`).
 - `GET /documents/search?q=...&limit=&offset=` — Postgres full-text search
   over `extracted_text`, ranked by `ts_rank`, with a highlighted snippet per
   result.
 - `GET /documents/{id}/export?format=pdf|docx|xlsx` — renders
-  `structured_data` into the requested format. `409` if the document isn't
-  `DONE` yet.
+  `structured_data` **and the WP-B extracted images** into the requested
+  format (best-effort structured export, not pixel-perfect layout — that's
+  a later WP for PDF). `409` if the document isn't `DONE` yet. See "Export"
+  below.
 - `GET /health` — liveness check.
 
 Interactive API docs: `http://localhost:8000/docs`.
@@ -341,7 +428,11 @@ curl -o report.pdf "http://localhost:8000/documents/<id>/export?format=pdf"
 
 The main app (`app/`) has no native OCR dependencies itself, but the OCR
 service (`ocr_service/`) needs local `tesseract-ocr` and `poppler-utils`
-(for PDF rasterization) binaries. Plus a running Postgres and Redis.
+(for PDF rasterization) binaries. For multi-script OCR also install the
+`tesseract-ocr-guj` / `tesseract-ocr-nep` language packs (and, to run the
+multi-script tests, the `fonts-lohit-gujr` / `fonts-lohit-deva` fonts) —
+the Docker image bakes all of these in already. Plus a running Postgres
+and Redis.
 
 ```bash
 # main app
@@ -412,8 +503,12 @@ Coverage includes:
   draining the actual Redis queue after a real `POST /documents/intake`,
   both for the happy path and the OCR-failure path.
 - `tests/test_search.py` — full-text search ranking/snippets/empty results.
-- `tests/test_export.py` — pdf/docx/xlsx rendering, `404`/`409`/`422`
-  handling.
+- `tests/test_export.py` — export endpoint: `404`/`409`/`422` handling,
+  and image crops flowing from storage into the generated docx.
+- `tests/test_export_render.py` — pure renderers: native-grid → real Word
+  table / real cells; `ruled_line_region` → labelled text (never a fake
+  table); all images embedded with caption hints; empty document exports
+  cleanly; a bad image crop degrades to a note, not a crash.
 - `tests/test_structure_service.py` — heuristic section/table parsing, plus
   the native-PDF-table hybrid path (uses `native_tables` when given,
   falls back to the heuristic when not, drops malformed tables).
@@ -427,10 +522,14 @@ needed:
 cd ocr_service && source .venv/bin/activate && pytest
 ```
 
-The native-PDF-text tests (including table extraction) run anywhere (only
-need `pdfplumber` + `reportlab`, no Tesseract). The two tests that actually
-invoke Tesseract auto-skip if a `tesseract` binary isn't on `PATH`, and run
-for real inside the `ocr` Docker image.
+The native-PDF-text tests (including table extraction and WP-B embedded
+image extraction) run anywhere (only need `pdfplumber` + `reportlab`, no
+Tesseract). The tests that actually invoke Tesseract auto-skip if a
+`tesseract` binary isn't on `PATH` — that includes the Gujarati/Nepali
+multi-script tests (which additionally skip without the `guj`/`nep`
+tessdata and a matching Lohit font) and the WP-B scanned-page region
+detection tests. All of them run for real inside the `ocr` Docker image,
+where the full suite is green.
 
 ## Storage abstraction
 

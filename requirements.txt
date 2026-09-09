@@ -11,5 +11,6 @@ redis==5.2.1
 pypdf==4.3.1
 python-docx==1.1.2
 openpyxl==3.1.5
+pillow==11.0.0  # WP-F: openpyxl needs it to embed images in xlsx exports
 python-multipart==0.0.19
 httpx==0.28.1

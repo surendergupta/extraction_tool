@@ -107,6 +107,7 @@ async def make_document(db_session: AsyncSession):
         raw_file_path: str | None = None,
         extracted_text: str | None = None,
         structured_data: dict | None = None,
+        image_regions: list | None = None,
         error_message: str | None = None,
     ) -> Document:
         document_id = uuid.uuid4()
@@ -122,6 +123,7 @@ async def make_document(db_session: AsyncSession):
             raw_file_path=raw_file_path,
             extracted_text=extracted_text,
             structured_data=structured_data,
+            image_regions=image_regions,
             error_message=error_message,
         )
         db_session.add(document)

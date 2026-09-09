@@ -226,6 +226,52 @@ def test_parse_structure_genuine_short_allcaps_heading_still_works():
     assert result["sections"][0]["title"] == "DIAGNOSIS"
 
 
+def test_parse_structure_uses_ruled_line_regions_on_ocr_path():
+    """WP-D: on the rasterize+OCR path, table content comes from ruled-line
+    table *regions* (bbox + region_text, NO grid). Entry shape differs from
+    native_pdf entries - a consumer must branch on `source`."""
+    text = "MEDICAL EXAMINATION REPORT\nsome body text here"
+    regions = [
+        {"bbox": [32, 427, 715, 883], "region_text": "Type of Examination Results\nEYE 6/6\nB.P. 120/80"},
+        {"bbox": None, "region_text": "   "},          # blank - dropped
+        {"not": "a dict"},                             # malformed - dropped
+    ]
+
+    result = parse_structure(text, ruled_line_regions=regions, space_heuristic_tables=False)
+
+    assert len(result["tables"]) == 1
+    t = result["tables"][0]
+    assert t["source"] == "ruled_line_region"
+    assert t["bbox"] == [32, 427, 715, 883]
+    assert "B.P. 120/80" in t["region_text"]
+    assert "rows" not in t and "raw_lines" not in t     # deliberately NOT a grid
+
+
+def test_parse_structure_ocr_path_disables_space_heuristic_tables():
+    """With space_heuristic_tables=False and no ruled-line regions (e.g. a
+    borderless-table or table-free scanned page), NO table is fabricated -
+    and the space-aligned lines are preserved as section content, not
+    silently dropped into a discarded table buffer."""
+    text = "RESULTS\nHaemoglobin    11.4 g/dL\nWBC    9.6\nPlatelets    2.1"
+
+    result = parse_structure(text, space_heuristic_tables=False)
+
+    assert result["tables"] == []
+    content = result["sections"][0]["content"]
+    assert "Haemoglobin    11.4 g/dL" in content and "WBC    9.6" in content
+
+
+def test_parse_structure_native_tables_win_over_ruled_regions():
+    """Defensive: if both are somehow supplied, native_pdf grids win."""
+    result = parse_structure(
+        "X",
+        native_tables=[[["A", "B"], ["1", "2"]]],
+        ruled_line_regions=[{"bbox": [0, 0, 1, 1], "region_text": "should be ignored"}],
+    )
+    assert len(result["tables"]) == 1
+    assert result["tables"][0]["source"] == "native_pdf"
+
+
 def test_parse_structure_drops_whole_table_when_too_few_rows_survive_filter():
     """A table can be well-formed (passes the 2x2 shape floor) yet still
     reduce to a single surviving row once its one spurious row is dropped -

@@ -65,6 +65,7 @@ def test_alembic_upgrade_downgrade_upgrade_round_trip():
         "raw_file_path",
         "extracted_text",
         "structured_data",
+        "image_regions",
         "error_message",
         "search_vector",
         "created_at",
@@ -76,3 +77,18 @@ def test_alembic_upgrade_downgrade_upgrade_round_trip():
 
     result = _run_alembic("upgrade", "head")
     assert result.returncode == 0, result.stderr
+
+    # 0002 down-revisions to 0001, not base - check the column is
+    # add/drop-reversible on its own too.
+    assert _run_alembic("downgrade", "0001").returncode == 0
+    conn = psycopg2.connect(
+        host="localhost", port=5432, user="sense_tool", password="sense_tool", dbname=_MIGRATION_TEST_DB
+    )
+    with conn.cursor() as cur:
+        cur.execute(
+            "select column_name from information_schema.columns where table_name='documents'"
+        )
+        cols_at_0001 = {row[0] for row in cur.fetchall()}
+    conn.close()
+    assert "image_regions" not in cols_at_0001
+    assert _run_alembic("upgrade", "head").returncode == 0
